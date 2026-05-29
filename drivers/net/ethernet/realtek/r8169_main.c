@@ -2990,6 +2990,32 @@ static void rtl_enable_clock_request(struct rtl8169_private *tp)
 				 PCI_EXP_LNKCTL_CLKREQ_EN);
 }
 
+static int pcie_max_speed;
+module_param(pcie_max_speed, int, 0444);
+MODULE_PARM_DESC(pcie_max_speed,
+	"Limit PCIe link speed: 0=auto, 1=Gen1(2.5GT/s), 2=Gen2(5GT/s), "
+	"3=Gen3(8GT/s), 4=Gen4(16GT/s). Use 3 to work around Gen4 signal "
+	"integrity issues on some platforms.");
+
+static void rtl_limit_pcie_speed(struct rtl8169_private *tp)
+{
+	static const u16 tls_map[] = {
+		[1] = PCI_EXP_LNKCTL2_TLS_2_5GT,
+		[2] = PCI_EXP_LNKCTL2_TLS_5_0GT,
+		[3] = PCI_EXP_LNKCTL2_TLS_8_0GT,
+		[4] = PCI_EXP_LNKCTL2_TLS_16_0GT,
+	};
+
+	if (pcie_max_speed <= 0 || pcie_max_speed >= (int)ARRAY_SIZE(tls_map))
+		return;
+
+	pcie_capability_clear_and_set_word(tp->pci_dev, PCI_EXP_LNKCTL2,
+					   PCI_EXP_LNKCTL2_TLS,
+					   tls_map[pcie_max_speed]);
+	dev_info(&tp->pci_dev->dev, "PCIe link speed limited to Gen%d\n",
+		 pcie_max_speed);
+}
+
 static void rtl_pcie_state_l2l3_disable(struct rtl8169_private *tp)
 {
 	/* work around an issue when PCI reset occurs during L2/L3 state */
@@ -4104,6 +4130,7 @@ static void rtl_hw_start_8169(struct rtl8169_private *tp)
 static void rtl_hw_start(struct  rtl8169_private *tp)
 {
 	rtl_unlock_config_regs(tp);
+	rtl_limit_pcie_speed(tp);
 	/* disable aspm and clock request before ephy access */
 	rtl_hw_aspm_clkreq_enable(tp, false);
 	RTL_W16(tp, CPlusCmd, tp->cp_cmd);
