@@ -636,3 +636,8 @@ config UNION_FIND
 
 config MIN_HEAP
 	bool
+
+config RUST_C2RUST_BOOT_TEST
+	bool "c2rust combined-image boot-screening switch (linux-rs#28)"
+	depends on RUST
+	default n
