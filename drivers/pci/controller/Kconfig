@@ -397,4 +397,15 @@ source "drivers/pci/controller/cadence/Kconfig"
 source "drivers/pci/controller/dwc/Kconfig"
 source "drivers/pci/controller/mobiveil/Kconfig"
 source "drivers/pci/controller/plda/Kconfig"
+
+config PCIE_AL_INTERNAL
+	bool "Annapurna Labs Alpine V2 internal PCIe host controller"
+	depends on OF && (ARM64 || COMPILE_TEST)
+	select PCI_HOST_COMMON
+	select IRQ_DOMAIN
+	help
+	  Host controller for the Alpine V2 internal PCIe bus (on-SoC AHCI,
+	  Ethernet, crypto, DMA). Configures AXI sub-master snoop (SMCC) and
+	  APP_CONTROL so internal bus masters do cache-coherent DMA.
+
 endmenu

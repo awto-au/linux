@@ -66,3 +66,4 @@ obj-$(CONFIG_ARM64) += pci-thunder-pem.o
 obj-$(CONFIG_ARM64) += pci-xgene.o
 endif
 endif
+obj-$(CONFIG_PCIE_AL_INTERNAL) += pcie-al-internal.o
