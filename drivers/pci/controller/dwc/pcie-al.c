@@ -359,6 +359,19 @@ static int al_pcie_probe(struct platform_device *pdev)
 
 	dev_dbg(dev, "From DT: controller_base: %pR\n", controller_res);
 
+	/*
+	 * Alpine V2: DWC DBI registers sit at controller_base + 0x10000.
+	 * Pre-set dbi_base so dw_pcie_get_resources() skips the "dbi"
+	 * resource lookup and avoids a resource conflict (forward-port of
+	 * the 6.12 patches/pcie-al-dbi-fix.c, applied in place for 7.1).
+	 */
+	pci->dbi_base = devm_ioremap(dev, controller_res->start + 0x10000,
+				     0x10000);
+	if (!pci->dbi_base) {
+		dev_err(dev, "couldn't map DBI base\n");
+		return -ENOMEM;
+	}
+
 	platform_set_drvdata(pdev, al_pcie);
 
 	return dw_pcie_host_init(&pci->pp);
