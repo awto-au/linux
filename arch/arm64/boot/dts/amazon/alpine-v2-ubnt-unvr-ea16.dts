@@ -1,0 +1,1067 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+/*
+ * Device Tree Source for Ubiquiti UNVR — board sysid 0xEA16 (NAND-boot, NO eMMC)
+ *
+ * Derived from alpine-v2-ubnt-unvr.dts (the port's ea1a / eMMC UNVR) and
+ * grounded in this unit's stock kernel live DTB:
+ *   docs/hw-reference/20260816-104601/live.dts   (dumped from the running 4.19 kernel)
+ *   docs/nand-1.3.35.md, docs/nor-boot-chain.md, docs/identity-partitions.md
+ *
+ * Same SoC as ea1a (Annapurna Labs Alpine V2 / AL-324, 4x Cortex-A57), but a
+ * different boot/storage layout:
+ *   - ea1a (port original): boots from eMMC over USB xHCI; NAND disabled.
+ *   - ea16 (this unit):     boots from NAND (al_boot/device_tree/linux_kernel/
+ *                           rootfs/chike); U-Boot + identity live in SPI-NOR.
+ *
+ * ea16-specific changes vs the port's ea1a DTS (see docs/linux-6.12-build.md for
+ * the annotated diff + rationale):
+ *   1. sysid ea1a -> ea16 in bootargs; add ubnthal.sysid=ea16.
+ *   2. NAND controller ENABLED with this unit's 5-partition map.
+ *   3. SPI-NOR partition map corrected to this unit's real layout (adds the
+ *      "cksum" tail partition; config size 0xdff000; stock partition labels).
+ *   4. ramoops moved to 0x92000000 to match the stock reserved region and stay
+ *      clear of the low kernel + embedded-initramfs load area used for netboot.
+ *   5. model string tagged "(ea16)".
+ *   6. Bay power is per-bay regulator-fixed + PCI-stub *-supply, not a gpio-hog,
+ *      so AHCI probe waits on it (docs/sata-bay-power-ordering.md, #104).
+ * Everything else (RAM, PCIe, MSI-X, eth0-3, i2c/gpio, sgpo, LEDs, thermal,
+ * hdd-pwrctl, sata-leds, sbclk 500 MHz) is identical to the ea1a DTS — the two
+ * boards share the same SoC and enclosure wiring.
+ */
+
+/dts-v1/;
+
+#include "alpine-v2.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+
+/ {
+	model = "Ubiquiti UNVR (ea16)";
+	compatible = "ubnt,unvr", "al,alpine-v2";
+
+	aliases {
+		serial0 = &uart0;
+		serial1 = &uart1;
+		serial2 = &uart2;
+		serial3 = &uart3;
+	};
+
+	chosen {
+		/*
+		 * ea16 boots from NAND. For the first Linux bring-up we netboot a
+		 * uImage with an embedded initramfs, so no root= is needed here; a
+		 * later NAND/rootfs boot appends root= via the U-Boot bootargs.
+		 * iommu.passthrough=1 MUST live here AND in the U-Boot bootargs
+		 * (U-Boot's `setenv bootargs` overrides the DTB value at boot).
+		 */
+		bootargs = "pci=pcie_bus_perf console=ttyS0,115200 sysid=ea16 ubnthal.sysid=ea16 reboot=warm rw iommu.passthrough=1";
+		stdout-path = "serial0:115200n8";
+		linux,pci-probe-only = <1>;
+	};
+
+	/*
+	 * 4 GB RAM in four 1 GB banks.
+	 * Three contiguous banks at 0x0-0xBFFF_FFFF, one at 0x2_0000_0000.
+	 */
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00 0x00000000 0x00 0x40000000>,
+		      <0x00 0x40000000 0x00 0x40000000>,
+		      <0x00 0x80000000 0x00 0x40000000>,
+		      <0x02 0x00000000 0x00 0x40000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/* Matches the stock reserved region; clear of the low netboot area. */
+		ramoops@92000000 {
+			compatible = "ramoops";
+			reg = <0x00 0x92000000 0x00 0x200000>;
+			record-size  = <0x100000>;
+			console-size = <0x10000>;
+			ftrace-size  = <0x10000>;
+			pmsg-size    = <0x80000>;
+			ecc-size     = <0x10>;
+		};
+	};
+
+	soc {
+		/*
+		 * Internal PCIe — hosts AHCI SATA, Ethernet, Crypto, DMA.
+		 * Uses the Alpine internal PCIe driver (pcie-al-internal.c) which
+		 * configures AXI sub-master snoop registers for cache-coherent DMA.
+		 * Not required to reach a serial shell; needed for SATA/al_dma.
+		 */
+		pci@fbc00000 {
+			compatible = "annapurna-labs,alpine-internal-pcie";
+			dma-coherent;
+			/*
+			 * Restores upstream alpine-v2.dtsi's AHCI INTx map (#55) -
+			 * we had none at all, worse than upstream. al_eth/al_dma/
+			 * al_ssm still have no entry here (upstream doesn't either)
+			 * and still log "of_irq_parse_pci failed rc=-22" at probe -
+			 * benign, MSI-X only (msi-parent = &msix); silenced properly
+			 * via a PCI_FIXUP_HEADER quirk in pcie-al-internal.c instead,
+			 * since a DT interrupt-map can't express "this pin is wired
+			 * to nothing" for devices that never use INTx at all.
+			 *
+			 * Re-applied (#131) after #130's UBSAN crash was proven
+			 * unrelated: reverting both this and the PCI quirk did NOT
+			 * stop the crash, and the console log shows the same crash
+			 * signature hours before either change was ever made today.
+			 * Root cause is a pre-existing race in al_eth_probe(), not
+			 * this DT node - see #131.
+			 */
+			#interrupt-cells = <1>;
+			interrupt-map-mask = <0xf800 0 0 7>;
+			interrupt-map = <0x4000 0 0 1 &gic GIC_SPI 53 IRQ_TYPE_LEVEL_HIGH>,
+					<0x4800 0 0 1 &gic GIC_SPI 54 IRQ_TYPE_LEVEL_HIGH>;
+
+			/*
+			 * DT stubs for the two integrated AHCI EPs, matched by
+			 * devfn (pci_set_of_node). Stock ahci.c reads nothing
+			 * here; the *-supply phandles exist so fw_devlink blocks
+			 * ahci probe until the bay rails are up (#104).
+			 * docs/sata-bay-power-ordering.md
+			 */
+			sata@8,0 {
+				reg = <0x4000 0 0 0 0>;
+				port0-target-supply = <&reg_hdd_bay3>;
+				port2-target-supply = <&reg_hdd_bay4>;
+			};
+
+			sata@9,0 {
+				reg = <0x4800 0 0 0 0>;
+				port0-target-supply = <&reg_hdd_bay2>;
+				port2-target-supply = <&reg_hdd_bay1>;
+			};
+		};
+
+		/* MSI-X controller — al,alpine-msix is the mainline compatible. */
+		msix: msix@fbe00000 {
+			compatible = "al,alpine-msix";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+		};
+
+		/* ----------------------------------------------------------------
+		 * Nodes below are NOT in mainline alpine-v2.dtsi.
+		 * ---------------------------------------------------------------- */
+
+		/* CCU (Cache Coherency Unit) */
+		ccu: ccu@f0090000 {
+			compatible = "annapurna-labs,al-ccu";
+			reg = <0x00 0xf0090000 0x00 0x10000>;
+			io_coherency = <1>;
+		};
+
+		/* NB Service (system fabric, error reporting) */
+		nb_service: nb-service@f0070000 {
+			compatible = "annapurna-labs,al-nb-service",
+				     "al,alpine-sysfabric-service", "syscon";
+			reg = <0x00 0xf0070000 0x00 0x10000>;
+			interrupts = <GIC_SPI 96 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 97 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 98 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 99 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/*
+		 * PBS (Peripheral Bus System) @ fd8a8000. This same block also
+		 * holds the SoC pad pinmux: pinmux is set by U-Boot before Linux
+		 * (dt-gaps M2) and no mainline driver binds it, so there is no
+		 * separate pinctrl@fd8a8000 node (it would duplicate this unit
+		 * address). Add an alpine-pinctrl child here if a mainline pinctrl
+		 * driver ever lands.
+		 */
+		pbs: pbs@fd8a8000 {
+			compatible = "annapurna-labs,al-pbs", "al,alpine-pbs";
+			reg = <0x00 0xfd8a8000 0x00 0x1000>;
+			interrupts = <GIC_SPI 0 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/* SerDes configuration block */
+		serdes: serdes@fd8c0000 {
+			compatible = "annapurna-labs,al-serdes";
+			reg = <0x00 0xfd8c0000 0x00 0x2400>;
+		};
+
+		/* Memory controller */
+		mc: memory-controller@f0080000 {
+			compatible = "annapurna-labs,alpine-mc";
+			reg = <0x00 0xf0080000 0x00 0x10000>;
+		};
+
+		/* Thermal sensor */
+		thermal: thermal@fd860a00 {
+			compatible = "annapurna-labs,al-thermal", "al,alpine-thermal";
+			reg = <0x00 0xfd860a00 0x00 0x100>;
+			#thermal-sensor-cells = <0>;
+		};
+
+		/* Watchdog timers (SP805) — only wdt0 enabled for reboot */
+		wdt0: watchdog@fd88c000 {
+			compatible = "arm,sp805", "arm,primecell";
+			reg = <0x00 0xfd88c000 0x00 0x1000>;
+			interrupts = <GIC_SPI 13 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		wdt1: watchdog@fd88d000 {
+			compatible = "arm,sp805", "arm,primecell";
+			reg = <0x00 0xfd88d000 0x00 0x1000>;
+			interrupts = <GIC_SPI 14 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+			status = "disabled";
+		};
+
+		wdt2: watchdog@fd88e000 {
+			compatible = "arm,sp805", "arm,primecell";
+			reg = <0x00 0xfd88e000 0x00 0x1000>;
+			interrupts = <GIC_SPI 15 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+			status = "disabled";
+		};
+
+		wdt3: watchdog@fd88f000 {
+			compatible = "arm,sp805", "arm,primecell";
+			reg = <0x00 0xfd88f000 0x00 0x1000>;
+			interrupts = <GIC_SPI 16 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+			status = "disabled";
+		};
+
+		/* GPIO controllers (PL061) — 6 banks, 8 pins each */
+		gpio0: gpio@fd887000 {
+			compatible = "arm,pl061", "arm,primecell";
+			reg = <0x00 0xfd887000 0x00 0x1000>;
+			interrupts = <GIC_SPI 2 IRQ_TYPE_LEVEL_HIGH>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		gpio1: gpio@fd888000 {
+			compatible = "arm,pl061", "arm,primecell";
+			reg = <0x00 0xfd888000 0x00 0x1000>;
+			interrupts = <GIC_SPI 3 IRQ_TYPE_LEVEL_HIGH>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		gpio2: gpio@fd889000 {
+			compatible = "arm,pl061", "arm,primecell";
+			reg = <0x00 0xfd889000 0x00 0x1000>;
+			interrupts = <GIC_SPI 4 IRQ_TYPE_LEVEL_HIGH>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		gpio3: gpio@fd88a000 {
+			compatible = "arm,pl061", "arm,primecell";
+			reg = <0x00 0xfd88a000 0x00 0x1000>;
+			interrupts = <GIC_SPI 5 IRQ_TYPE_LEVEL_HIGH>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		gpio4: gpio@fd88b000 {
+			compatible = "arm,pl061", "arm,primecell";
+			reg = <0x00 0xfd88b000 0x00 0x1000>;
+			interrupts = <GIC_SPI 6 IRQ_TYPE_LEVEL_HIGH>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		gpio5: gpio@fd897000 {
+			compatible = "arm,pl061", "arm,primecell";
+			reg = <0x00 0xfd897000 0x00 0x1000>;
+			interrupts = <GIC_SPI 7 IRQ_TYPE_LEVEL_HIGH>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		/* SGPO (Serial GPIO Output) — drives SATA activity LEDs */
+		sgpo: sgpo@fd8b4000 {
+			compatible = "annapurna-labs,alpine-sgpo";
+			reg = <0x00 0xfd8b4000 0x00 0x5000>;
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		/*
+		 * I2C bus "i2c-pld" (DesignWare) — SB clock 500 MHz, 100 kHz bus.
+		 * Hosts PCA9546 mux and PCA9575 GPIO expanders for HDD control.
+		 */
+		i2c_pld: i2c@fd880000 {
+			compatible = "snps,designware-i2c";
+			reg = <0x00 0xfd880000 0x00 0x1000>;
+			interrupts = <GIC_SPI 21 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			/* 100 kHz (Standard-mode) = stock's speed. NOT max-by-default:
+			 * the s35390a RTC on mux ch0 is timing-fussy and at 400 kHz mis-reads
+			 * a phantom START/STOP and holds SDA -> whole-bus wedge, unrecoverable
+			 * in SW on this bus (pld-i2c SCL/SDA have no GPIO alt for a bit-bang
+			 * deblock, and the DW v1.20 core has no HW SDA-stuck recovery - see
+			 * docs/rtc-s35390a-fault.md). Stock ran 100 kHz and talked to the RTC
+			 * fine; slower SCL = more setup/hold margin = no latch. The tolerant
+			 * devices (PCA9575/EEPROM/mux/adt7475) don't care about the speed. */
+			clock-frequency = <100000>;
+			/* SDA hold = 300 ns, from the stock working DTB (live.dts:255,
+			 * i2c-sda-hold-time-ns=0x12c). Without it the DW driver reuses the
+			 * leftover DW_IC_SDA_HOLD register value (U-Boot/reset), which is
+			 * too short and makes the timing-fussy s35390a RTC lose arbitration
+			 * / hold SDA -> whole-bus wedge + `controller timed out` flood.
+			 * The tolerant devices (adt7475/EEPROM/PCA9575) never noticed. */
+			i2c-sda-hold-time-ns = <300>;
+			/* Stock's proven raw SCL counts (live.dts:249-254) so the
+			 * s35390a doesn't wedge. At clock-frequency=100000 the SS
+			 * pair is used; fs/hs carried for completeness. Honored by
+			 * our patched U-Boot DW i2c driver (docs/rtc-s35390a-fault.md);
+			 * mainline Linux ignores these (non-standard vendor props). */
+			i2c-ss-scl-hcnt-raw = <0x855>;
+			i2c-ss-scl-lcnt-raw = <0xb0b>;
+			i2c-fs-scl-hcnt-raw = <0x19d>;
+			i2c-fs-scl-lcnt-raw = <0x320>;
+			i2c-hs-scl-hcnt-raw = <0xf3>;
+			i2c-hs-scl-lcnt-raw = <0x198>;
+			/* mainline ignores the raw counts above (#98) - this is the
+			 * standard, mainline-honored equivalent for lcnt. Derivation:
+			 * docs/rtc-s35390a-fault.md. */
+			i2c-scl-falling-time-ns = <1000>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* PCA9546 4-channel I2C mux.
+			 * idle-disconnect: deselect all channels between accesses so a
+			 * stuck downstream device (the s35390a on ch0 can hold SDA after
+			 * an interrupted transfer — see docs/rtc-s35390a-fault.md) cannot
+			 * persistently poison the main bus / ch3. Reduces exposure; does
+			 * NOT recover a held ch0 (that needs the RTC clocked/power-cycled). */
+			i2c_mux: i2c-mux@71 {
+				compatible = "nxp,pca9546";
+				reg = <0x71>;
+				i2c-mux-idle-disconnect;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				/* Channel 0: RTC (Seiko S-35390A) */
+				i2c@0 {
+					reg = <0>;
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					/* OFFLINE for now (status="disabled"): U-Boot does the RTC
+					 * reset-at-probe (clears POC/BLD before Linux, alpine.c), and
+					 * keeping Linux off ch0's RTC avoids re-triggering the SDA-hold
+					 * wedge (docs/rtc-s35390a-fault.md, #86) so the ch0/SFP-EEPROM
+					 * segment stays scannable + no al_eth poll flood. Fedora keeps
+					 * time via NTP. Re-enable once a Linux-side ch0 recovery exists. */
+					rtc@30 {
+						compatible = "sii,s35390a";
+						reg = <0x30>;
+						status = "disabled";
+					};
+				};
+
+				/* Channel 1: SFP+ module EEPROM (SFF-8472, eth2). No
+				 * device node of our own here - sfp.c (drivers/net/phy/sfp.c)
+				 * owns the EEPROM read via the sfp0 node's i2c-bus phandle
+				 * (docs/i2c-map.md: i2c-2 = mux ch1). Phandle instead of a
+				 * raw adapter number is what removes the #98 failure class
+				 * permanently - the vendor path used the board-params i2c
+				 * adapter number, which shifts whenever another i2c
+				 * controller is enabled/disabled. */
+				sfp_i2c: i2c@1 {
+					reg = <1>;
+					#address-cells = <1>;
+					#size-cells = <0>;
+				};
+
+				/* Channel 3: ADT7475 hardware monitor */
+				i2c@3 {
+					reg = <3>;
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					hwmon@2e {
+						compatible = "adi,adt7475";
+						reg = <0x2e>;
+					};
+				};
+			};
+
+			/* PCA9575 #0 (0x20) — pin 2: SFP+ 1G link LED */
+			i2c_gpio0: gpio@20 {
+				compatible = "nxp,pca9575";
+				reg = <0x20>;
+				gpio-controller;
+				#gpio-cells = <2>;
+			};
+
+			/* PCA9575 #1 (0x21) — HDD bay power/presence/fault */
+			i2c_gpio1: gpio@21 {
+				compatible = "nxp,pca9575";
+				reg = <0x21>;
+				gpio-controller;
+				#gpio-cells = <2>;
+
+				/*
+				 * Bay power-enable lines 0-3 are owned by the
+				 * reg_hdd_bay1-4 regulator-fixed nodes below, not a
+				 * gpio-hog: AHCI needs a supplier it can defer on
+				 * (docs/sata-bay-power-ordering.md, #104).
+				 */
+			};
+
+			/*
+			 * PCA9575 #2 (0x29): NOT populated on the 4-bay UNVR — it
+			 * drives Pro bays 5-8 (dt-gaps, "unpopulated, correctly
+			 * absent"). Node omitted so the pca953x driver never probes
+			 * an absent chip (was failing -121/EREMOTEIO at boot).
+			 */
+
+			/*
+			 * Board config/identity EEPROM (U5, AT24C64 — 8 KiB,
+			 * 16-bit addressed). This one chip holds BOTH the ubnthal
+			 * identity schema (boardid/systemid/serial/MACs) AND the
+			 * DDR config records at offset 0x400 (0xAA SPD-pointer,
+			 * 0xBB voltage-GPIO, 0xCC impedance, + the JEDEC DDR4 SPD)
+			 * — live-confirmed via `i2ctransfer -y 0 w2@0x57 ...`.
+			 * Binds `at24` -> nvmem sysfs (/sys/bus/i2c/devices/…/eeprom)
+			 * so userspace reads it with a proper driver, no pokes.
+			 * See docs/ddr-config-reverse.md, dt-gaps M1.
+			 */
+			eeprom@57 {
+				compatible = "atmel,24c64";
+				reg = <0x57>;
+				pagesize = <32>;
+				#address-cells = <1>;
+				#size-cells = <1>;
+			};
+		};
+
+		/*
+		 * I2C general-purpose bus. Disabled to match stock (both 1.3.35 and
+		 * 5.1.25 firmware leave it disabled - no RPS monitor driver/config
+		 * exists in any Ubiquiti firmware, #64). It was briefly enabled to
+		 * hunt for a digital RPS monitor that doesn't exist (U48 is very
+		 * likely a pure analog ORing part) - enabling it shifted every raw
+		 * board-params i2c adapter number by one, breaking the SFP+ EEPROM
+		 * read (#98: i2c-id=2 landed on the RTC's mux channel instead of
+		 * the SFP's).
+		 */
+		i2c_gen: i2c@fd894000 {
+			compatible = "snps,designware-i2c";
+			reg = <0x00 0xfd894000 0x00 0x1000>;
+			interrupts = <GIC_SPI 8 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-frequency = <100000>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		/*
+		 * Ethernet ports (Annapurna Labs out-of-tree al_eth driver)
+		 * Port 1: 1GbE RJ45 — RGMII, external PHY at MDIO addr 4 (AR8031/33)
+		 * Port 2: 10G SFP+  — SerDes group 3 lane 0
+		 * Ports 0,3: disabled
+		 */
+		eth0: ethernet@fc000000 {
+			compatible = "annapurna-labs,al-eth";
+			reg = <0x00 0xfc000000 0x00 0x1000>;
+			interrupts = <GIC_SPI 61 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		eth1: ethernet@fc100000 {
+			compatible = "annapurna-labs,al-eth";
+			reg = <0x00 0xfc100000 0x00 0x1000>;
+			interrupts = <GIC_SPI 62 IRQ_TYPE_LEVEL_HIGH>;
+			port-id = <1>;
+			phy-mode = "rgmii";
+			phy-addr = <4>;
+			mdio-freq-khz = <1000>;
+			auto-neg-mode = "out-of-band";
+			status = "okay";
+		};
+
+		eth2: ethernet@fc200000 {
+			compatible = "annapurna-labs,al-eth";
+			reg = <0x00 0xfc200000 0x00 0x1000>;
+			interrupts = <GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH>;
+			port-id = <2>;
+			phy-mode = "10gbase-r";
+			serdes-grp = <3>;
+			serdes-lane = <0>;
+			dac-length = <3>;
+			auto-neg = "disabled";
+			link-training = "disabled";
+			fec = "disabled";
+			force-1000base-x = "enabled";
+			status = "okay";
+			/* phylink + sfp.c link management (#113). al_eth binds by PCI
+			 * ID and matches this node by port-id == PCI slot
+			 * (al_eth_phylink.c), not by compatible/reg. */
+			managed = "in-band-status";
+			sfp = <&sfp0>;
+		};
+
+		eth3: ethernet@fc300000 {
+			compatible = "annapurna-labs,al-eth";
+			reg = <0x00 0xfc300000 0x00 0x1000>;
+			interrupts = <GIC_SPI 64 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		/*
+		 * External PCIe port 0 — xHCI USB 3.0 host (ASMedia).
+		 * On ea16 there is no eMMC behind it, but the port is still present
+		 * (front USB / Bluetooth). Left enabled; harmless if nothing attached.
+		 */
+		pcie_ext0: pcie@fd800000 {
+			compatible = "amazon,al-alpine-v2-pcie";
+			device_type = "pci";
+			reg = <0x00 0xfd800000 0x00 0x10000>,
+			      <0x00 0xfb600000 0x00 0x100000>;
+			reg-names = "controller", "config";
+			dma-coherent;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			interrupt-parent = <&gic>;
+			interrupt-map-mask = <0x00 0x00 0x00 0x07>;
+			interrupt-map = <0x00 0x00 0x00 0x01
+					 &gic 0 41 IRQ_TYPE_LEVEL_HIGH>;
+			msi-parent = <&msix>;
+			ranges = <0x02000000 0x00 0xc0010000
+				  0x00 0xc0010000 0x00 0x7ff0000>,
+				 <0x01000000 0x00 0x00010000
+				  0x00 0xc0000000 0x00 0x10000>;
+			bus-range = <0x00 0xff>;
+			linux,pci-domain = <1>;
+			status = "okay";
+		};
+
+		/* External PCIe ports 1-3 — disabled on UNVR */
+		pcie_external1: pcie@fd820000 {
+			compatible = "pci-host-ecam-generic";
+			device_type = "pci";
+			reg = <0x00 0xfd820000 0x00 0x20000>;
+			reg-names = "ecam";
+			dma-coherent;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			interrupt-parent = <&gic>;
+			interrupt-map-mask = <0x00 0x00 0x00 0x07>;
+			interrupt-map = <0x00 0x00 0x00 0x01
+					 &gic 0 42 IRQ_TYPE_LEVEL_HIGH>;
+			msi-parent = <&msix>;
+			cfg-space-offset = <0x2000>;
+			ranges = <0x00000000 0x00 0xfb700000
+				  0x00 0xfb700000 0x00 0x100000>,
+				 <0x01000000 0x00 0x00020000
+				  0x00 0xc8000000 0x00 0x10000>,
+				 <0x02000000 0x00 0xc8010000
+				  0x00 0xc8010000 0x00 0x7ff0000>;
+			bus-range = <0x00 0xff>;
+			status = "disabled";
+		};
+
+		pcie_external2: pcie@fd840000 {
+			compatible = "pci-host-ecam-generic";
+			device_type = "pci";
+			reg = <0x00 0xfd840000 0x00 0x20000>;
+			reg-names = "ecam";
+			dma-coherent;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			interrupt-parent = <&gic>;
+			interrupt-map-mask = <0x00 0x00 0x00 0x07>;
+			interrupt-map = <0x00 0x00 0x00 0x01
+					 &gic 0 43 IRQ_TYPE_LEVEL_HIGH>;
+			msi-parent = <&msix>;
+			cfg-space-offset = <0x2000>;
+			ranges = <0x00000000 0x00 0xfb800000
+				  0x00 0xfb800000 0x00 0x100000>,
+				 <0x01000000 0x00 0x00030000
+				  0x00 0xd0000000 0x00 0x10000>,
+				 <0x02000000 0x00 0xd0010000
+				  0x00 0xd0010000 0x00 0x7ff0000>;
+			bus-range = <0x00 0xff>;
+			status = "disabled";
+		};
+
+		pcie_external3: pcie@fd900000 {
+			compatible = "pci-host-ecam-generic";
+			device_type = "pci";
+			reg = <0x00 0xfd900000 0x00 0x20000>;
+			reg-names = "ecam";
+			dma-coherent;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			interrupt-parent = <&gic>;
+			interrupt-map-mask = <0x00 0x00 0x00 0x07>;
+			interrupt-map = <0x00 0x00 0x00 0x01
+					 &gic 0 44 IRQ_TYPE_LEVEL_HIGH>;
+			msi-parent = <&msix>;
+			cfg-space-offset = <0x2000>;
+			ranges = <0x00000000 0x00 0xfb900000
+				  0x00 0xfb900000 0x00 0x100000>,
+				 <0x01000000 0x00 0x00040000
+				  0x00 0xd8000000 0x00 0x10000>,
+				 <0x02000000 0x00 0xd8010000
+				  0x00 0xd8010000 0x00 0x7ff0000>;
+			bus-range = <0x00 0xff>;
+			status = "disabled";
+		};
+
+		/*
+		 * SPI-NOR (32 MiB MX25U25635F, DesignWare SSI) — U-Boot + preboot, env,
+		 * identity, recovery, config. Map = this unit's real layout (per-node
+		 * comments below; full reference docs/mtd.md).
+		 */
+		spi: spi@fd882000 {
+			compatible = "amazon,alpine-dw-apb-ssi",
+				     "snps,dw-spi-mmio", "snps,dw-apb-ssi";
+			reg = <0x00 0xfd882000 0x00 0x1000>;
+			interrupts = <GIC_SPI 23 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-names = "sbclk";
+			num-cs = <4>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			flash@0 {
+				compatible = "jedec,spi-nor";
+				reg = <0>;
+				spi-max-frequency = <37500000>;
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				/*
+				 * Preboot + stock U-Boot, laid out by the Annapurna TOC @0x80000
+				 * (magic 0x070c070c). Exact offsets within this partition:
+				 *   0x00000  preboot obj  = S2 + al_boot + stage3 (payload @0x21000)
+				 *   0x80000  the TOC itself
+				 *   0xA1000  uboot obj    = stock U-Boot 2015.07 (hdr @0xA1048,
+				 *            AArch64, loads/runs at RAM 0x1100000), fills to 0x1c0000
+				 * "al_boot" the CODE lives here (in preboot), NOT the empty NAND
+				 * al_boot partition. docs/bootloader.md, nor-boot-chain.md.
+				 */
+				partition@0 {
+					reg = <0x000000 0x1c0000>;
+					label = "u-boot";
+				};
+
+				/* Stock U-Boot env (holds eth1addr). OUR U-Boot uses mtd3
+				 * (Factory) instead, so this stays stock's — left intact for a
+				 * clean fallback to stock. */
+				partition@1c0000 {
+					reg = <0x1c0000 0x10000>;
+					label = "u-boot env";
+				};
+
+				/* Redundant copy of the stock env. */
+				partition@1d0000 {
+					reg = <0x1d0000 0x10000>;
+					label = "u-boot env redundant";
+				};
+
+				/*
+				 * Stock: blank 0xFF, unused. REPURPOSED: our U-Boot stores its
+				 * OWN env here (CONFIG_ENV_OFFSET=0x1e0000) - #81, docs/mtd.md.
+				 * read-only in Linux so Fedora never clobbers our U-Boot env.
+				 * (Label kept "Factory" for stock traceability; content is ours.)
+				 */
+				partition@1e0000 {
+					reg = <0x1e0000 0x10000>;
+					label = "Factory";
+					read-only;
+				};
+
+				/*
+				 * Board identity blob (NOT a chip - a NOR region Ubiquiti named
+				 * "EEPROM"). base MAC @0x0, boardid @0xC, ONIE TLV @0xd000, RSA
+				 * key @0xe004. ubnthal reads it; our U-Boot reads the MAC (#89).
+				 * The real EEPROM chip is the 24C64 @ i2c 0x57 (DDR blob).
+				 */
+				partition@1f0000 {
+					reg = <0x1f0000 0x10000>;
+					label = "EEPROM";
+					read-only;
+				};
+
+				/* STOCK U-Boot loads this on a recovery boot (recovery_mem_read
+				 * + AL_RECOVERY_OFFSET, board.c). Fallback kernel, 16 MiB. */
+				partition@200000 {
+					reg = <0x200000 0x1000000>;
+					label = "recovery kernel";
+				};
+
+				/* ext4: persistent device settings (mounted /tmp/.config).
+				 * Linux/userspace only — STOCK U-Boot never touches it. Wiped by
+				 * a factory reset. Stock-usage summary: docs/mtd.md. */
+				partition@1200000 {
+					reg = <0x1200000 0xdff000>;
+					label = "config";
+				};
+
+				/*
+				 * DEAD: named "cksum" but it is 100% 0x00 and never a live
+				 * checksum (nothing reads it). 5.1.25 dropped this partition
+				 * (absorbed into config). Kept here only to map the real flash;
+				 * safe to remove. docs/mtd.md.
+				 */
+				partition@1fff000 {
+					reg = <0x1fff000 0x1000>;
+					label = "cksum";
+				};
+			};
+		};
+
+		/*
+		 * NAND flash (1 GiB MT29F8G08, al-nand ctrl) — ENABLED on ea16 (boot +
+		 * root storage; the port's ea1a DTS disabled it because ea1a boots eMMC).
+		 * Full layout + provenance: docs/mtd.md. Verified on hardware.
+		 */
+		nand: nand@fa100000 {
+			compatible = "annapurna-labs,al-nand";
+			reg = <0x00 0xfa100000 0x00 0x202000>;
+			interrupts = <GIC_SPI 1 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-names = "sbclk";
+			max-onfi-timing-mode = <1>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			status = "okay";
+
+			/*
+			 * NAME ONLY — this NAND partition slot is EMPTY (0xFF) on this unit.
+			 * The al_boot CODE that actually runs (Annapurna preboot: S2 +
+			 * al_boot + stage3) lives in the NOR, inside the mtd0 u-boot
+			 * partition (preboot region 0x0-0x80000) — it is used every boot.
+			 * This NAND slot is reserved for a NAND-boot variant we don't use;
+			 * the slot is unused, the code is not. docs/bootloader.md, mtd.md.
+			 */
+			partition@0 {
+				reg = <0x00000000 0x00200000>;
+				label = "al_boot";
+			};
+
+			/* Stock kernel DTB slot (multi-DT container). Empty 0xFF here. */
+			partition@200000 {
+				reg = <0x00200000 0x00100000>;
+				label = "device_tree";
+			};
+
+			/* STOCK U-Boot loads the kernel from here on a normal boot.
+			 * (Our Fedora flash writes here too.) */
+			partition@300000 {
+				reg = <0x00300000 0x01000000>;
+				label = "linux_kernel";
+			};
+
+			/* Root filesystem (~1004 MiB; squashfs on stock). bootargs root=
+			 * target only — the kernel mounts it; U-Boot never reads it. */
+			partition@1300000 {
+				reg = <0x01300000 0x3ec00000>;
+				label = "rootfs";
+			};
+
+			/*
+			 * DEAD: "chike" holds a firmware-embedded JPEG (a factory selfie,
+			 * Galaxy S10+ 2019) with ZERO firmware users. 5.1.25 dropped this
+			 * partition (absorbed into rootfs). Kept only to map the real flash;
+			 * safe to remove. docs/mtd.md, docs/hardware.md.
+			 */
+			partition@3ff00000 {
+				reg = <0x3ff00000 0x00100000>;
+				label = "chike";
+			};
+		};
+	};
+
+	/*
+	 * Reboot controller (triggers watchdog reset). At root, not under /soc:
+	 * it has no reg/ranges, so a unit address under the simple-bus soc would
+	 * be malformed. al_reboot binds by compatible via root-node platform
+	 * population; the wdt-parent phandle is location-independent.
+	 */
+	reboot: reboot {
+		compatible = "annapurna-labs,alpine-reboot";
+		wdt-parent = <&wdt0>;
+	};
+
+	/*
+	 * 10G SFP+ cage (eth2). At root like reboot/thermal-zones above: no
+	 * reg of its own, just an i2c-bus phandle to the mux channel the
+	 * module EEPROM answers on (i2c-2 = mux ch1, docs/i2c-map.md). No
+	 * mod-def0/los/tx-fault/tx-disable GPIOs - none identified on this
+	 * board (#112); sfp.c degrades cleanly without them (always-present
+	 * cage, 1s poll, laser always on with a warning).
+	 * docs: debris/code/al_eth-phylink-wip/eth-10g-phylink.md
+	 */
+	sfp0: sfp {
+		compatible = "sff,sfp";
+		i2c-bus = <&sfp_i2c>;
+	};
+
+	/* Thermal zone — critical shutdown at 105 C */
+	thermal-zones {
+		cpu-thermal {
+			polling-delay-passive = <250>;
+			polling-delay = <1000>;
+			thermal-sensors = <&thermal>;
+
+			trips {
+				cpu_crit: cpu-crit {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "critical";
+				};
+			};
+		};
+	};
+
+	/* GPIO keys — active-low reset button on GPIO4 pin 6 (KEY_RESTART) */
+	gpio-keys {
+		compatible = "gpio-keys";
+
+		button-restart {
+			label = "Reset Button";
+			linux,code = <KEY_RESTART>;
+			debounce-interval = <200>;
+			gpios = <&gpio4 6 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	/* Front-panel "U" logo LEDs (active-low) */
+	leds {
+		compatible = "gpio-leds";
+
+		led-ulogo-blue {
+			label = "ulogo_blue";
+			gpios = <&gpio3 7 GPIO_ACTIVE_LOW>;
+			linux,default-trigger = "default-on";
+		};
+
+		led-ulogo-white {
+			label = "ulogo_white";
+			gpios = <&gpio4 5 GPIO_ACTIVE_LOW>;
+		};
+
+		/* PCA9575 #0 (0x20) pin 2 - SFP+ 1G link LED, active-low
+		 * (uboot-port commit 30438a0). Was undeclared in Linux DT -
+		 * no /sys/class/leds entry, only reachable via raw gpiod. */
+		led-sfp {
+			label = "sfp_1g";
+			gpios = <&i2c_gpio0 2 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	/*
+	 * Drive-bay power rails — PCA9575 @0x21 lines 0-3, active-high.
+	 * Modelled as regulators so AHCI gets a real probe-order dependency on
+	 * i2c -> pca9575 -> rail; see docs/sata-bay-power-ordering.md (#104).
+	 * No voltage stated: the line is an enable for the bay's power switch,
+	 * and which rails it gates is not established from a verified source.
+	 */
+	reg_hdd_bay1: regulator-hdd-bay1 {
+		compatible = "regulator-fixed";
+		regulator-name = "hdd-bay1-pwr";
+		gpios = <&i2c_gpio1 0 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		regulator-boot-on;
+		regulator-always-on;
+	};
+
+	reg_hdd_bay2: regulator-hdd-bay2 {
+		compatible = "regulator-fixed";
+		regulator-name = "hdd-bay2-pwr";
+		gpios = <&i2c_gpio1 1 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		regulator-boot-on;
+		regulator-always-on;
+	};
+
+	reg_hdd_bay3: regulator-hdd-bay3 {
+		compatible = "regulator-fixed";
+		regulator-name = "hdd-bay3-pwr";
+		gpios = <&i2c_gpio1 2 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		regulator-boot-on;
+		regulator-always-on;
+	};
+
+	reg_hdd_bay4: regulator-hdd-bay4 {
+		compatible = "regulator-fixed";
+		regulator-name = "hdd-bay4-pwr";
+		gpios = <&i2c_gpio1 3 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		regulator-boot-on;
+		regulator-always-on;
+	};
+
+	/*
+	 * HDD bay power control — signals via PCA9575 @0x21:
+	 *   pins 0-3 power-enable, 4-7 presence (active-low), 12-15 fault LEDs.
+	 * Force-power-on workaround: GPIO5 pin 2.
+	 * No mainline ui,hdd-pwrctl driver binds this; kept as the board wiring
+	 * record. pwren is owned by reg_hdd_bay1-4 above.
+	 */
+	hdd-pwrctl {
+		compatible = "ui,hdd-pwrctl";
+		force-power-on-wa = <&gpio5 2 GPIO_ACTIVE_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		hdd@0 {
+			reg = <0>;
+			slot-no = <1>;
+			pwren     = <&i2c_gpio1 0 GPIO_ACTIVE_HIGH>;
+			present   = <&i2c_gpio1 4 GPIO_ACTIVE_LOW>;
+			fault-led = <&i2c_gpio1 12 GPIO_ACTIVE_HIGH>;
+		};
+
+		hdd@1 {
+			reg = <1>;
+			slot-no = <2>;
+			pwren     = <&i2c_gpio1 1 GPIO_ACTIVE_HIGH>;
+			present   = <&i2c_gpio1 5 GPIO_ACTIVE_LOW>;
+			fault-led = <&i2c_gpio1 13 GPIO_ACTIVE_HIGH>;
+		};
+
+		hdd@2 {
+			reg = <2>;
+			slot-no = <3>;
+			pwren     = <&i2c_gpio1 2 GPIO_ACTIVE_HIGH>;
+			present   = <&i2c_gpio1 6 GPIO_ACTIVE_LOW>;
+			fault-led = <&i2c_gpio1 14 GPIO_ACTIVE_HIGH>;
+		};
+
+		hdd@3 {
+			reg = <3>;
+			slot-no = <4>;
+			pwren     = <&i2c_gpio1 3 GPIO_ACTIVE_HIGH>;
+			present   = <&i2c_gpio1 7 GPIO_ACTIVE_LOW>;
+			fault-led = <&i2c_gpio1 15 GPIO_ACTIVE_HIGH>;
+		};
+	};
+
+	/* SATA activity/presence LEDs — via SGPO controller */
+	sata-leds {
+		compatible = "annapurna-labs,al-sata-sw-leds";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		led@0 {
+			reg = <0>;
+			label = "sata:host0:port0";
+			pci_domain = <0>;
+			pci_bus = <0>;
+			pci_dev = <0x08>;
+			port = <0>;
+			gpios = <&sgpo 16 GPIO_ACTIVE_HIGH>;
+			slot-no = <3>;
+		};
+
+		led@1 {
+			reg = <1>;
+			label = "sata:host0:port2";
+			pci_domain = <0>;
+			pci_bus = <0>;
+			pci_dev = <0x08>;
+			port = <2>;
+			gpios = <&sgpo 18 GPIO_ACTIVE_HIGH>;
+			slot-no = <4>;
+		};
+
+		led@2 {
+			reg = <2>;
+			label = "sata:host1:port0";
+			pci_domain = <0>;
+			pci_bus = <0>;
+			pci_dev = <0x09>;
+			port = <0>;
+			gpios = <&sgpo 20 GPIO_ACTIVE_HIGH>;
+			slot-no = <2>;
+		};
+
+		led@3 {
+			reg = <3>;
+			label = "sata:host1:port2";
+			pci_domain = <0>;
+			pci_bus = <0>;
+			pci_dev = <0x09>;
+			port = <2>;
+			gpios = <&sgpo 22 GPIO_ACTIVE_HIGH>;
+			slot-no = <1>;
+		};
+	};
+};
+
+/*
+ * Override sbclk from the DTSI (placeholder 1 MHz) to the real 500 MHz SB clock.
+ * Critical for UART baud, timers and I2C timing.
+ */
+&sbclk {
+	clock-frequency = <500000000>;
+};
+
+/* UART0: serial console (ttyS0 @ 115200) */
+&uart0 {
+	status = "okay";
+};
+
+/*
+ * UART2 (ttyS2) = the RPS-connector PHY UART — RS-232 via MAX3221 (U122) on
+ * the RPS header, 115200 8N1 JSON (see docs/rps-subsystem.md). NOT Bluetooth:
+ * owner-confirmed no BT on this board; the Ubiquiti "CSR" path is UDM-Pro shared
+ * code (docs/dt-gaps-hardware-of-record.md S2). Also usable as a 2nd RS-232
+ * console. Binds 8250 -> /dev/ttyS2.
+ */
+&uart2 {
+	status = "okay";
+};
+
+/*
+ * SP804 timer0: unused. Linux clocksource/clockevent is the ARMv8 arch timer
+ * (armv8-timer), not SP804. The dtsi enables timer0 with clocks=<&sbclk> but no
+ * clock-names="apb_pclk", so the arm,primecell/AMBA pclk lookup never resolves
+ * and the device defers probe forever ("deferred probe pending: reason
+ * unknown"). Disable it to match timer1/2/3 (already disabled in the dtsi).
+ */
+&timer0 {
+	/*
+	 * SP804 deferred forever because an arm,primecell device needs "apb_pclk"
+	 * BY NAME for the AMBA bus-clock lookup; the dtsi node has clocks=<&sbclk>
+	 * with no clock-names. Fix (not disable): name it. One clock named apb_pclk
+	 * is used for both the timer and the bus (valid per the sp804 binding).
+	 * UNVERIFIED on hardware — confirm the timer probes once the boot-source
+	 * (which kernel+DTB U-Boot actually loads) is resolved so DTB changes test.
+	 */
+	clock-names = "apb_pclk";
+};
