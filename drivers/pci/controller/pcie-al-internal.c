@@ -45,47 +45,7 @@
 #include "pci-host-common.h"
 #include <linux/platform_device.h>
 
-/*
- * AXI Sub-Master Configuration & Control (SMCC) registers.
- * Located at PCI config space offsets within each device's 4KB window.
- *
- * Each device has up to 4 AXI sub-masters. Each sub-master's SMCC
- * register block is AL_ADAPTER_SMCC_BUNDLE_SIZE bytes apart.
- *
- * Sub-master 0: offset 0x110
- * Sub-master 1: offset 0x130
- * Sub-master 2: offset 0x150
- * Sub-master 3: offset 0x170
- */
-#define AL_ADAPTER_SMCC			0x110
-#define AL_ADAPTER_SMCC_BUNDLE_SIZE	0x20
-#define AL_ADAPTER_SMCC_CONF_SNOOP_OVR	BIT(0)
-#define AL_ADAPTER_SMCC_CONF_SNOOP_EN	BIT(1)
-#define AL_ADAPTER_SMCC_SNOOP_BITS	(AL_ADAPTER_SMCC_CONF_SNOOP_OVR | \
-					 AL_ADAPTER_SMCC_CONF_SNOOP_EN)
-
-/* Number of AXI sub-masters per device */
-#define AL_ADAPTER_SMCC_NUM_SUBMASTERS	4
-
-/*
- * Application Control register.
- * The stock driver sets the lower 10 bits to 0x3ff on ALL devices,
- * and clears bits [15:10] (via MOVK instruction replacing the lower
- * 16 bits with 0x03ff, preserving upper 16 bits).
- */
-#define AL_ADAPTER_APP_CONTROL		0x220
-#define AL_ADAPTER_APP_CONTROL_LO16	0x03ff
-
-/*
- * Device slot threshold for sub-master configuration:
- * - Slot <= 5: SMCC snoop is configured on ALL 4 sub-masters
- * - Slot >  5: SMCC snoop is configured on sub-master 0 only
- * ALL devices get APP_CONTROL configured regardless of slot.
- */
-#define AL_INTERNAL_SLOT_THRESHOLD	5
-
-/* Annapurna Labs PCI vendor ID */
-#define PCI_VENDOR_ID_ANNAPURNA_LABS	0x1c36
+#include "pcie-al-alpine-regs.h"
 
 /*
  * Bus notifier callback: configures SMCC snoop and APP_CONTROL
