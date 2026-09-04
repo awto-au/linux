@@ -599,7 +599,8 @@ static int i2c_dw_set_sda_hold(struct dw_i2c_dev *dev)
 		 * extends incoming SDA low to high transition while SCL is
 		 * high but it appears to help also above issue.
 		 */
-		if (!(dev->sda_hold_time & DW_IC_SDA_HOLD_RX_MASK))
+		if (!(dev->sda_hold_time & DW_IC_SDA_HOLD_RX_MASK) &&
+		    !device_property_read_bool(dev->dev, "snps,no-sda-rx-hold"))
 			dev->sda_hold_time |= 1 << DW_IC_SDA_HOLD_RX_SHIFT;
 
 		dev_dbg(dev->dev, "SDA Hold Time TX:RX = %d:%d\n",
@@ -642,6 +643,16 @@ void __i2c_dw_disable(struct dw_i2c_dev *dev)
 	 */
 	if (dev->mode == DW_IC_SLAVE && (ic_stats & DW_IC_STATUS_SLAVE_ACTIVITY))
 		abort_needed = true;
+
+	/*
+	 * IC_ENABLE.ABORT terminates the transfer mid-byte, which some targets
+	 * (S-35390A, Fig 46) answer by holding SDA low until clocked through -
+	 * an unrecoverable bus wedge. Introduced in 2023 (2409205acd3c); the
+	 * vendor 4.19 kernel that drives this board has no abort and does not
+	 * wedge. Opt out per-controller.
+	 */
+	if (device_property_read_bool(dev->dev, "snps,no-enable-abort"))
+		abort_needed = false;
 
 	if (abort_needed) {
 		if (!(enable & DW_IC_ENABLE_ENABLE)) {
