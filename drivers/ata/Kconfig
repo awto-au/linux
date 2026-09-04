@@ -160,6 +160,19 @@ config SATA_AHCI_PLATFORM
 
 	  If unsure, say N.
 
+config AHCI_ALPINE
+	tristate "Amazon Annapurna Labs Alpine AHCI SATA support"
+	depends on PCI
+	select SATA_HOST
+	help
+	  This option enables support for the AHCI SATA controllers found on
+	  Amazon Annapurna Labs Alpine SoCs. Unlike the generic SATA_AHCI
+	  driver, it gives each port its own MSI-X vector instead of sharing
+	  one INTx line across the whole controller. It takes over the Alpine
+	  controllers from SATA_AHCI when both are enabled.
+
+	  If unsure, say N.
+
 config AHCI_BRCM
 	tristate "Broadcom AHCI SATA support"
 	depends on ARCH_BRCMSTB || BMIPS_GENERIC || ARCH_BCM_NSP || \
