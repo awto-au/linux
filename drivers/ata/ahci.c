@@ -2849,6 +2849,12 @@ static int ahci_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	ata_print_version_once(&pdev->dev, DRV_VERSION);
 
+	/* Alpine needs per-port MSI-X, which board_ahci_al's AHCI_HFLAG_NO_MSI
+	 * rules out here; ahci_alpine drives it instead.
+	 */
+	if (IS_ENABLED(CONFIG_AHCI_ALPINE) && board_id == board_ahci_al)
+		return -ENODEV;
+
 	/* The AHCI driver can only drive the SATA ports, the PATA driver
 	   can drive them all so if both drivers are selected make sure
 	   AHCI stays out of the way */
