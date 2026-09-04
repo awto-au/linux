@@ -238,6 +238,8 @@ CONFIG_ATA=y
 CONFIG_ATA_VERBOSE_ERROR=y
 CONFIG_SATA_AHCI=y
 CONFIG_SATA_AHCI_PLATFORM=y
+# Per-port MSI-X; takes the Alpine controllers over from SATA_AHCI.
+CONFIG_AHCI_ALPINE=y
 
 # ----------------------------------------------------------------------
 # MD / RAID / Device Mapper
