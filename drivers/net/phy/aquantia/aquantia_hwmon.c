@@ -56,8 +56,8 @@ static int aqr_hwmon_set(struct phy_device *phydev, int reg, long value)
 {
 	int temp;
 
-	if (value >= 128000 || value < -128000)
-		return -ERANGE;
+	/* s16, LSB = 1/256 degC: clamp like other hwmon limit writes (thermal core passes -INT_MAX) */
+	value = clamp_val(value, -128000, 127996);
 
 	temp = value * 256 / 1000;
 
