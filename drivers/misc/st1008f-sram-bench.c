@@ -1,0 +1,323 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * RTL930x on-chip SRAM vs DDR access latency (TL-ST1008F, awto-tl-st1008f #103).
+ * `cat /sys/kernel/debug/st1008f_sram_bench` runs it: ns per access, CP0 Count timed, IRQs off.
+ * `cat /sys/kernel/debug/st1008f_sram_test`: pattern test of the free pool (st1008f-selftest, #108).
+ * SRAM comes from the mmio-sram gen_pool, found like OpenWrt clk-rtl83xx (whole-device pool).
+ */
+
+#include <linux/debugfs.h>
+#include <linux/genalloc.h>
+#include <linux/init.h>
+#include <linux/irqflags.h>
+#include <linux/math64.h>
+#include <linux/mutex.h>
+#include <linux/of.h>
+#include <linux/of_platform.h>
+#include <linux/platform_device.h>
+#include <linux/seq_file.h>
+#include <linux/slab.h>
+#include <asm/addrspace.h>
+#include <asm/barrier.h>
+#include <asm/io.h>
+#include <asm/mipsregs.h>
+#include <asm/time.h>
+
+#define LINE		32			/* 34Kc D-cache line */
+#define NLINES		512			/* 16 KiB: half the D-cache, no evictions */
+#define BYTES		(NLINES * LINE)
+#define REPS		5
+#define SRAMSAR0	((void __iomem *)0xb8004000)	/* CPU_SRAM_SEG0_ADDR */
+
+struct region {
+	const char *name;
+	unsigned long k0, k1;	/* cached / uncached alias */
+};
+
+static DEFINE_MUTEX(bench_lock);
+static struct region regs[2] = { { .name = "sram" }, { .name = "ddr" } };
+static u16 perm[NLINES];
+static unsigned long sink;
+
+static struct gen_pool *sram_pool(void)
+{
+	struct platform_device *pdev = NULL;
+	struct device_node *np;
+	struct gen_pool *pool;
+
+	for_each_compatible_node(np, NULL, "mmio-sram") {
+		pdev = of_find_device_by_node(np);
+		if (pdev) {
+			of_node_put(np);
+			break;
+		}
+	}
+	if (!pdev)
+		return NULL;
+	pool = gen_pool_get(&pdev->dev, NULL);
+	put_device(&pdev->dev);
+	return pool;
+}
+
+static int bench_setup(struct seq_file *m)
+{
+	struct gen_pool *pool;
+	unsigned long va;
+	phys_addr_t pa;
+	void *ddr;
+	u32 x = 1;
+	int i;
+
+	if (regs[0].k0)
+		return 0;
+	pool = sram_pool();
+	if (!pool) {
+		seq_puts(m, "sram_bench: no mmio-sram pool (CONFIG_SRAM, DT node?)\n");
+		return -ENODEV;
+	}
+	va = gen_pool_alloc(pool, BYTES);
+	ddr = kmalloc(BYTES, GFP_KERNEL);
+	if (!va || !ddr) {
+		if (va)
+			gen_pool_free(pool, va, BYTES);
+		kfree(ddr);
+		seq_puts(m, "sram_bench: allocation failed\n");
+		return -ENOMEM;
+	}
+	pa = gen_pool_virt_to_phys(pool, va);
+	regs[0].k0 = CKSEG0ADDR(pa);
+	regs[0].k1 = CKSEG1ADDR(pa);
+	regs[1].k0 = (unsigned long)ddr;
+	regs[1].k1 = CKSEG1ADDR(virt_to_phys(ddr));
+
+	/* fixed LCG shuffle: random line order so DRAM prefetch (MCR) cannot hide latency */
+	for (i = 0; i < NLINES; i++)
+		perm[i] = i;
+	for (i = NLINES - 1; i > 0; i--) {
+		int j;
+		u16 t;
+
+		x = x * 1103515245 + 12345;
+		j = (x >> 16) % (i + 1);
+		t = perm[i];
+		perm[i] = perm[j];
+		perm[j] = t;
+	}
+	return 0;
+}
+
+/* Lines of r hold a pointer chain through `base` (k0 or k1); built uncached, D-cache left cold */
+static unsigned long chain(const struct region *r, unsigned long base)
+{
+	int i;
+
+	dma_cache_wback_inv(r->k0, BYTES);
+	for (i = 0; i < NLINES; i++)
+		*(volatile unsigned long *)(r->k1 + perm[i] * LINE) =
+			base + perm[(i + 1) % NLINES] * LINE;
+	wmb();
+	return base + perm[0] * LINE;
+}
+
+static u32 chase(unsigned long p)
+{
+	u32 t0, t1;
+	int i;
+
+	t0 = read_c0_count();
+	for (i = 0; i < NLINES; i++)
+		p = *(volatile unsigned long *)p;
+	t1 = read_c0_count();
+	sink = p;
+	return t1 - t0;
+}
+
+static u32 store_uc(const struct region *r)
+{
+	u32 t0, t1;
+	int i;
+
+	t0 = read_c0_count();
+	for (i = 0; i < NLINES; i++)
+		*(volatile u32 *)(r->k1 + perm[i] * LINE) = i;
+	wmb();	/* sync: count until the write buffer drained */
+	t1 = read_c0_count();
+	return t1 - t0;
+}
+
+enum test { UC_RD, C_MISS, C_HIT, UC_WR, NTESTS };
+static const char * const test_name[NTESTS] = { "uc_rd", "c_miss", "c_hit", "uc_wr" };
+
+static u32 run_one(const struct region *r, enum test t)
+{
+	unsigned long flags, start;
+	u32 cyc;
+
+	start = chain(r, t == UC_RD || t == UC_WR ? r->k1 : r->k0);
+	local_irq_save(flags);
+	switch (t) {
+	case UC_RD:
+	case C_MISS:
+		cyc = chase(start);
+		break;
+	case C_HIT:
+		chase(start);
+		cyc = chase(start);
+		break;
+	default:
+		cyc = store_uc(r);
+		break;
+	}
+	local_irq_restore(flags);
+	return cyc;
+}
+
+/* Count cycles for NLINES accesses -> tenths of ns per access */
+static u32 dns(u32 cyc)
+{
+	return div64_u64((u64)cyc * 10000000000ULL, (u64)mips_hpt_frequency * NLINES);	/* u64 divisor */
+}
+
+static int bench_show(struct seq_file *m, void *v)
+{
+	u32 sar = __raw_readl(SRAMSAR0);
+	int ret, i, t, k;
+
+	mutex_lock(&bench_lock);
+	ret = bench_setup(m);
+	if (ret)
+		goto out;
+	seq_printf(m, "sram_bench: SRAMSAR0 %08x, sram phys %08x, ddr phys %08x, count %u Hz, %d lines x %d B, min/max of %d\n",
+		   sar, (u32)CPHYSADDR(regs[0].k1), (u32)CPHYSADDR(regs[1].k1), mips_hpt_frequency,
+		   NLINES, LINE, REPS);
+	/* an unmapped segment decodes nowhere: never touch it (#103) */
+	if (!(sar & 1) || (sar & ~0xffu) != ((u32)CPHYSADDR(regs[0].k1) & ~0xffffu)) {
+		seq_puts(m, "sram_bench: SRAM segment 0 not mapped at the pool address, refused\n");
+		ret = -ENXIO;
+		goto out;
+	}
+	for (i = 0; i < ARRAY_SIZE(regs); i++) {
+		for (t = 0; t < NTESTS; t++) {
+			u32 lo = U32_MAX, hi = 0;
+
+			for (k = 0; k < REPS; k++) {
+				u32 c = run_one(&regs[i], t);
+
+				lo = min(lo, c);
+				hi = max(hi, c);
+			}
+			/* Count runs at CPU/2 on the 34Kc: 2 CPU cycles per tick */
+			seq_printf(m, "sram_bench: %-4s %-6s min %u.%u ns max %u.%u ns (%u.%u cpu cycles)\n",
+				   regs[i].name, test_name[t], dns(lo) / 10, dns(lo) % 10,
+				   dns(hi) / 10, dns(hi) % 10, 2 * lo / NLINES, (20 * lo / NLINES) % 10);
+		}
+	}
+out:
+	mutex_unlock(&bench_lock);
+	return ret;
+}
+DEFINE_SHOW_ATTRIBUTE(bench);
+
+/* st1008f_sram_test: patterns of uboot-port memtest.c over the free pool, uncached then cached (#108) */
+enum { P_ADDR, P_WALK1, P_WALK0, P_CHECK, P_ICHECK, P_RAND, P_N };
+static const char * const pat_name[P_N] = { "addr", "walk1", "walk0", "check", "icheck", "rand" };
+
+static u32 sram_pat(int t, u32 pa, u32 *rs)
+{
+	u32 i = pa >> 2, x;
+
+	switch (t) {
+	case P_ADDR:	return pa;
+	case P_WALK1:	return 1u << (i & 31);
+	case P_WALK0:	return ~(1u << (i & 31));
+	case P_CHECK:	return i & 1 ? 0xaaaaaaaa : 0x55555555;
+	case P_ICHECK:	return i & 1 ? 0x55555555 : 0xaaaaaaaa;
+	default:
+		x = *rs;
+		x ^= x << 13;
+		x ^= x >> 17;
+		x ^= x << 5;
+		return *rs = x;
+	}
+}
+
+static u32 sram_unit(struct seq_file *m, unsigned long va, u32 pa, size_t size, bool cached, int t)
+{
+	u32 rs = 0x1008f ^ (t << 24), errs = 0, xor_or = 0, off;
+
+	for (off = 0; off < size; off += 4)
+		__raw_writel(sram_pat(t, pa + off, &rs), (void __iomem *)(va + off));
+	if (cached)
+		dma_cache_wback_inv(va, size);	/* reads below refill from the SRAM */
+	rs = 0x1008f ^ (t << 24);
+	for (off = 0; off < size; off += 4) {
+		u32 want = sram_pat(t, pa + off, &rs), got = __raw_readl((void __iomem *)(va + off));
+
+		if (got == want)
+			continue;
+		xor_or |= want ^ got;
+		if (errs++ < 16)
+			seq_printf(m, "sram_test: E %s %s pa %08x want %08x got %08x xor %08x\n",
+				   cached ? "cached" : "uncached", pat_name[t], pa + off, want, got,
+				   want ^ got);
+	}
+	seq_printf(m, "sram_test: S %s %s %zu B errs %u xor %08x\n", cached ? "cached" : "uncached",
+		   pat_name[t], size, errs, xor_or);
+	return errs;
+}
+
+static int sram_test_show(struct seq_file *m, void *v)
+{
+	u32 sar = __raw_readl(SRAMSAR0), errs = 0;
+	struct gen_pool *pool;
+	unsigned long va = 0;
+	size_t avail, size;
+	int ret = 0, t, c;
+	u32 pa;
+
+	mutex_lock(&bench_lock);
+	pool = sram_pool();
+	if (!pool) {
+		seq_puts(m, "sram_test: no mmio-sram pool (CONFIG_SRAM, DT node?)\n");
+		ret = -ENODEV;
+		goto out;
+	}
+	avail = gen_pool_avail(pool);
+	/* largest free chunk: the pool may be fragmented (bench buffers, clock code) */
+	for (size = avail & ~(size_t)(LINE - 1); size >= LINE; size = (size / 2) & ~(size_t)(LINE - 1)) {
+		va = gen_pool_alloc(pool, size);
+		if (va)
+			break;
+	}
+	if (!va) {
+		seq_printf(m, "sram_test: no free chunk (pool %zu B, avail %zu B)\n", gen_pool_size(pool), avail);
+		ret = -ENOMEM;
+		goto out;
+	}
+	pa = (u32)gen_pool_virt_to_phys(pool, va);
+	if (!(sar & 1) || (sar & ~0xffu) != (pa & ~0xffffu)) {	/* unmapped: decodes nowhere (#103) */
+		seq_printf(m, "sram_test: SRAMSAR0 %08x: segment 0 not mapped at %08x, refused\n", sar, pa);
+		ret = -ENXIO;
+		goto free;
+	}
+	seq_printf(m, "sram_test: SRAMSAR0 %08x, pool %zu B, testing %zu B at phys %08x\n", sar,
+		   gen_pool_size(pool), size, pa);
+	for (c = 0; c < 2; c++)
+		for (t = 0; t < P_N; t++)
+			errs += sram_unit(m, c ? CKSEG0ADDR(pa) : CKSEG1ADDR(pa), pa, size, c, t);
+	seq_printf(m, "sram_test: done errs %u\n", errs);
+free:
+	gen_pool_free(pool, va, size);
+out:
+	mutex_unlock(&bench_lock);
+	return ret;
+}
+DEFINE_SHOW_ATTRIBUTE(sram_test);
+
+static int __init st1008f_sram_bench_init(void)
+{
+	debugfs_create_file("st1008f_sram_bench", 0400, NULL, NULL, &bench_fops);
+	debugfs_create_file("st1008f_sram_test", 0400, NULL, NULL, &sram_test_fops);
+	return 0;
+}
+late_initcall(st1008f_sram_bench_init);

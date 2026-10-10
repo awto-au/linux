@@ -403,6 +403,13 @@ config SRAM
 config SRAM_EXEC
 	bool
 
+config ST1008F_SRAM_BENCH
+	bool "TL-ST1008F on-chip SRAM vs DDR latency bench (debugfs)"
+	depends on SRAM && MACH_REALTEK_RTL && DEBUG_FS
+	help
+	  debugfs file st1008f_sram_bench: ns per access to the RTL930x on-chip SRAM
+	  and to DDR; st1008f_sram_test: SRAM pattern test. Bring-up aid; say N otherwise.
+
 config DW_XDATA_PCIE
 	depends on PCI
 	tristate "Synopsys DesignWare xData PCIe driver"
