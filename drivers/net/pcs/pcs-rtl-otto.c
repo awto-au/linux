@@ -2960,7 +2960,8 @@ static int rtpcs_930x_sds_10g_idle(struct rtpcs_serdes *sds)
 		usleep_range(100, 200); /* wait ~100 usecs before retry */
 	} while (ktime_before(ktime_get(), timeout));
 
-	dev_warn(sds->ctrl->dev, "SerDes %u: waiting for RX idle timed out\n", sds->id);
+	/* bit = 1: RX idle (no signal). A dark partner is normal here (SDK: silent) */
+	dev_dbg(sds->ctrl->dev, "SerDes %u: no RX signal within 10 ms\n", sds->id);
 	return -ETIMEDOUT;
 }
 
