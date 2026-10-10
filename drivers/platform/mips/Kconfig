@@ -49,4 +49,15 @@ config TPLINK_ST1008F_MODE_SWITCH
 	  SFP modules. 10G modules are not touched. Also sums the power
 	  every fitted module declares and warns over a budget.
 
+config TPLINK_ST1008F_LEDS
+	tristate "TP-Link TL-ST1008F v2 port LED patterns (boot, error, panic)"
+	depends on MACH_REALTEK_RTL || COMPILE_TEST
+	depends on OF
+	help
+	  Puts the 24 port LEDs of the TL-ST1008F v2 under RTL930x software
+	  LED control for status patterns: a latched error (sysfs), a kernel
+	  panic pattern (panic_blink) and release of the boot loader's
+	  "booting" pattern. Hardware blink modes only, so a pattern keeps
+	  showing after the CPU stops.
+
 endif # MIPS_PLATFORM_DEVICES
