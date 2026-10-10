@@ -1,0 +1,799 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * TP-Link TL-ST1008F v2: 3-position mode switch, ported from the stock rtk.ko
+ * threads TP_CHKPATTERN (check_pattern_thread_func) and TP_CHKMEDIA (tpSfpSetType).
+ * Vendor function map and deviations: awto-tl-st1008f issue #64.
+ */
+
+#include <linux/debugfs.h>
+#include <linux/delay.h>
+#include <linux/ethtool.h>
+#include <linux/gpio/consumer.h>
+#include <linux/i2c.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/netdevice.h>
+#include <linux/of.h>
+#include <linux/platform_device.h>
+#include <linux/rtnetlink.h>
+#include <linux/seq_file.h>
+#include <linux/sfp.h>
+#include <linux/workqueue.h>
+#include <net/net_namespace.h>
+#include <net/netdev_lock.h>
+
+#define ST_NPORTS		8
+#define ST_NPINS		3
+#define ST_EEPROM_ADDR		0x50
+#define ST_EEPROM_LEN		128	/* tpEpmGet reads 0x80 bytes */
+#define ST_I2C_CHUNK		16	/* RTL9300 I2C controller max data length */
+
+/* custom_get_pattern_mode: osal_time_usleep(30000) before each pin read */
+#define ST_SETTLE_US		30000
+/* check_pattern_thread_func: osal_time_sleep(1) per loop (HZ=100 -> 1 s) */
+#define ST_PATTERN_POLL_MS	1000
+/* tpSfpSetType: schedule_timeout_interruptible(0x32) per loop (HZ=100 -> 500 ms) */
+#define ST_MEDIA_POLL_MS	500
+/* tpSfpGetType: presence re-read after osal_time_usleep(300000) */
+#define ST_RECHECK_MS		300
+/* ours: removal = 2 failed I2C probes in a row (vendor reads MOD-DEF0, see #29) */
+#define ST_REMOVE_MISSES	2
+
+/* SFP power budget (#30): warn only, never blocks. Rules: docs/hardware.md "SFP power". */
+#define ST_BOARD_INPUT_MW	24000	/* PSU 12 V 2 A */
+#define ST_CU_1G_MW		1200	/* FS SFP-GE-T: 350 mA x 3.47 V */
+#define ST_CU_2G5_MW		2000	/* FS SFP-2.5G-T: "< 2 W" */
+#define ST_CU_10G_MW		3000	/* FS SFP-10G-T-30: 3.0 W max (also 5GBASE-T) */
+
+/* 24 W input - est. 6-8 W board draw (unmeasured) */
+static unsigned int power_budget_mw = 15000;
+module_param(power_budget_mw, uint, 0644);
+MODULE_PARM_DESC(power_budget_mw, "SFP declared-power budget in mW (warn only)");
+
+/* tpSfpGetType classes; also the rtk_port_10gMedia_t id the vendor sets */
+enum {
+	ST_CLS_NONE = 0,	/* no event, or EEPROM read error */
+	ST_CLS_1G = 2,		/* "1G fiber insert" (MEDIA_FIBER_1G) */
+	ST_CLS_2G5 = 3,		/* "2.5G fiber insert" (MEDIA_FIBER_2_5G) */
+	ST_CLS_OUT = 10,	/* "port %d outsert" */
+};
+
+enum st_action {
+	ST_ACT_NONE,		/* no module, read error, or a class the pattern ignores */
+	ST_ACT_1000X_AN,	/* media 2: 1000BASE-X, in-band AN on */
+	ST_ACT_2500X_FORCED,	/* media 3: 2500BASE-X, AN off */
+	ST_ACT_DOWN,		/* unmatched pattern: vendor leaves the port at media NONE */
+};
+
+static const char * const st_act_name[] = {
+	[ST_ACT_NONE] = "none",
+	[ST_ACT_1000X_AN] = "1000base-x-an",
+	[ST_ACT_2500X_FORCED] = "2500base-x-forced",
+	[ST_ACT_DOWN] = "down",
+};
+
+struct st_port {
+	struct sfp_bus *bus;		/* matches net_device->sfp_bus of the cage's port */
+	struct i2c_adapter *i2c;	/* the cage's ID EEPROM bus (sfp node "i2c-bus") */
+	bool present;			/* vendor: !DAT_0004cc9c ("was absent") */
+	bool unread;			/* 0x50 answers, ID read fails: counted empty, retried */
+	int misses;
+	bool elec;			/* tpSfpIsElec: "SFP-T" at EEPROM 120 */
+	unsigned int power_mw;		/* counted toward the budget; 0 = empty */
+	const char *power_why;
+	int cls;			/* class from the last insert */
+	u8 pat;				/* per-port byte from sfpPatternSet: 1 or 2 */
+	int media;			/* vendor media id logged for the decision */
+	enum st_action act;
+	bool down_done;			/* ST_ACT_DOWN applied once for this decision */
+	bool set_seen;			/* set_ks: readback after our last set is in set_ks */
+	struct ethtool_link_ksettings set_ks;
+	bool downed;			/* we cleared IFF_UP */
+	int res;			/* last apply result */
+	const char *note;		/* last apply outcome, for the log and debugfs */
+	char ifname[IFNAMSIZ];
+};
+
+struct st_ms {
+	struct device *dev;
+	struct gpio_descs *pins;	/* gpio0 17/18/19, raw (no inversion), like the vendor */
+	struct workqueue_struct *wq;	/* ordered: the two passes never overlap */
+	struct delayed_work pattern_work, media_work;
+	struct mutex lock;
+	struct dentry *dbg;
+	int v[ST_NPINS];
+	int pattern;			/* 0 until the first latch */
+	struct st_port port[ST_NPORTS];
+	unsigned int power_total_mw;	/* last total logged */
+	bool power_over;		/* warned, not yet back under */
+};
+
+/* custom_judge_pattern_mode (rtk.ko 0x0020c240), verbatim */
+static int st_judge(const int *v)
+{
+	if (v[0] == 1) {
+		if (v[1] == 0)
+			return v[2] == 1 ? 2 : 3;
+	} else if (v[0] == 0 && v[1] == 1) {
+		return v[2] == 1 ? 1 : 3;
+	}
+	return 3;
+}
+
+/* custom_get_pattern_mode (0x0020c29c): settle, then raw DAT bit, per pin */
+static int st_get_pattern(struct st_ms *ms)
+{
+	int i, r;
+
+	for (i = 0; i < ST_NPINS; i++) {
+		fsleep(ST_SETTLE_US);
+		r = gpiod_get_raw_value_cansleep(ms->pins->desc[i]);
+		if (r < 0)	/* vendor keeps the stale sample too */
+			dev_info(ms->dev, "gpio read failed ret=%d\n", r);
+		else
+			ms->v[i] = r;
+	}
+	return st_judge(ms->v);
+}
+
+/* sfpPatternSet (0x0020c394): per-port byte 1 = "1G", 2 = "2.5G" */
+static void st_pattern_set(struct st_ms *ms, int pattern)
+{
+	int i;
+
+	if (pattern < 1 || pattern > 3) {
+		dev_info(ms->dev, "error: pattern=%d is not defined\n", pattern);
+		return;
+	}
+	for (i = 0; i < ST_NPORTS; i++)
+		ms->port[i].pat = pattern == 1 ? 1 : pattern == 3 ? 2 : (i < 4 ? 1 : 2);
+}
+
+/* our 18/19 decode (U-Boot `rtk mode`, #46), for comparison only */
+static const char *st_position(const struct st_ms *ms)
+{
+	if (ms->v[1] == 1 && ms->v[2] == 1)
+		return "M1";
+	if (ms->v[1] == 0 && ms->v[2] == 1)
+		return "M2";
+	if (ms->v[1] == 1 && ms->v[2] == 0)
+		return "M3";
+	return "invalid";
+}
+
+static int st_i2c_probe(struct st_port *p)
+{
+	union i2c_smbus_data d;
+
+	return i2c_smbus_xfer(p->i2c, ST_EEPROM_ADDR, 0, I2C_SMBUS_READ, 0,
+			      I2C_SMBUS_BYTE_DATA, &d);
+}
+
+static int st_read_eeprom(struct st_port *p, u8 *id)
+{
+	bool blk = i2c_check_functionality(p->i2c, I2C_FUNC_SMBUS_READ_I2C_BLOCK);
+	union i2c_smbus_data d;
+	int off, n, ret;
+
+	for (off = 0; off < ST_EEPROM_LEN; off += n) {
+		n = blk ? ST_I2C_CHUNK : 1;
+		d.block[0] = n;
+		ret = i2c_smbus_xfer(p->i2c, ST_EEPROM_ADDR, 0, I2C_SMBUS_READ, off,
+				     blk ? I2C_SMBUS_I2C_BLOCK_DATA : I2C_SMBUS_BYTE_DATA, &d);
+		if (ret < 0)
+			return ret;
+		if (blk)
+			memcpy(id + off, &d.block[1], n);
+		else
+			id[off] = d.byte;
+	}
+	return 0;
+}
+
+/* tpEepromCheckSum (rtcore.ko 0x00015100): CC_BASE and CC_EXT */
+static bool st_checksum_ok(const u8 *id)
+{
+	u8 base = 0, ext = 0;
+	int i;
+
+	for (i = 0; i < 63; i++)
+		base += id[i];
+	for (i = 64; i < 95; i++)
+		ext += id[i];
+	return base == id[63] && ext == id[95];
+}
+
+/* tpSfpGetType (rtcore.ko 0x000151bc), insert branch */
+static int st_classify(struct st_ms *ms, int i, const u8 *id)
+{
+	struct st_port *p = &ms->port[i];
+	struct device *dev = ms->dev;
+	int cls;
+
+	if (!st_checksum_ok(id)) {
+		dev_info(dev, "dev %d eeprom checksum error!\n", i);
+		return 7;
+	}
+	if (!(id[3] & BIT(0)) && !(id[8] & BIT(2))) {
+		if (id[3] & 0xf0) {
+			dev_info(dev, "port %d: 10G fiber insert\n", i);
+			cls = 5;
+		} else if ((u8)(id[12] - 0x19) < 8) {
+			dev_info(dev, "port %d: 2.5G fiber insert\n", i);
+			cls = ST_CLS_2G5;
+		} else if (!(id[6] & 0xcf)) {
+			dev_info(dev, "port %d: unknown media insert\n", i);
+			cls = 7;
+		} else {
+			dev_info(dev, "port %d: 1G fiber insert\n", i);
+			cls = ST_CLS_1G;
+		}
+	} else {
+		dev_info(dev, "port %d: copper insert, length %d\n", i, id[18]);
+		cls = id[18] == 0 ? 5 : id[18] < 3 ? 6 : id[18] < 5 ? 7 : 8;
+	}
+	p->elec = !memcmp(&id[120], "SFP-T", 5);
+	if (p->elec)
+		dev_info(dev, "port %d: it is also an eletronic port fiber\n", i);
+	return cls;
+}
+
+/* tpSfpSetType (rtk.ko 0x0020b07c), fiber path: class x per-port pattern byte */
+static void st_decide(struct st_ms *ms, int i)
+{
+	struct st_port *p = &ms->port[i];
+	struct device *dev = ms->dev;
+
+	p->act = ST_ACT_NONE;
+	p->media = 0;
+	p->down_done = false;
+	p->set_seen = false;
+	p->note = NULL;
+	if (p->cls == ST_CLS_2G5 && p->pat == 1) {
+		dev_info(dev, "port %d media %d for auto speed down\n", i, 2);
+		p->act = ST_ACT_1000X_AN;
+		p->media = 2;
+	} else if (p->cls == ST_CLS_2G5) {
+		dev_info(dev, "port %d media %d\n", i, 3);
+		p->act = ST_ACT_2500X_FORCED;
+		p->media = 3;
+	} else if (p->cls == ST_CLS_1G && p->pat != 2) {
+		dev_info(dev, "port %d media %d\n", i, 2);
+		p->act = ST_ACT_1000X_AN;
+		p->media = 2;
+	} else if (p->cls == ST_CLS_1G) {
+		dev_info(dev, "port %d will not set because of unmatched pattern\n", i);
+		p->act = ST_ACT_DOWN;
+	} else if (p->cls >= 1 && p->cls <= 9) {
+		dev_info(dev, "port %d media %d\n", i, p->cls);
+		p->media = p->cls;
+	}
+}
+
+static struct net_device *st_netdev(struct st_port *p)
+{
+	struct net_device *nd;
+
+	ASSERT_RTNL();
+	if (IS_ERR_OR_NULL(p->bus))
+		return NULL;
+	for_each_netdev(&init_net, nd)
+		if (nd->sfp_bus == p->bus)
+			return nd;
+	return NULL;
+}
+
+static bool st_ks_matches(const struct ethtool_link_ksettings *ks, bool want_2500)
+{
+	const unsigned long *adv = ks->link_modes.advertising;
+
+	if (want_2500)
+		return ks->base.autoneg == AUTONEG_DISABLE &&
+		       (ks->base.speed == SPEED_2500 || ks->base.speed == SPEED_UNKNOWN);
+	return ks->base.autoneg == AUTONEG_ENABLE &&
+	       test_bit(ETHTOOL_LINK_MODE_1000baseX_Full_BIT, adv) &&
+	       !test_bit(ETHTOOL_LINK_MODE_2500baseX_Full_BIT, adv);
+}
+
+static int st_set_ks(struct net_device *nd, struct ethtool_link_ksettings *ks)
+{
+	int ret;
+
+	netdev_lock_ops(nd);
+	ret = nd->ethtool_ops->set_link_ksettings(nd, ks);
+	netdev_unlock_ops(nd);
+	return ret;
+}
+
+/* remember what the netdev reports after our set; returns 1 (changed) */
+static int st_set_done(struct st_port *p, struct net_device *nd)
+{
+	p->set_seen = !__ethtool_get_link_ksettings(nd, &p->set_ks);
+	return 1;
+}
+
+/* media 2 / media 3 -> phylink interface via ethtool; returns 1 if it changed something */
+static int st_apply_speed(struct st_port *p, struct net_device *nd)
+{
+	bool want_2500 = p->act == ST_ACT_2500X_FORCED;
+	int mode = want_2500 ? ETHTOOL_LINK_MODE_2500baseX_Full_BIT :
+			       ETHTOOL_LINK_MODE_1000baseX_Full_BIT;
+	struct ethtool_link_ksettings ks = {};
+	int ret;
+
+	p->note = want_2500 ? "2500base-x, autoneg off" : "1000base-x, autoneg on";
+	if (nd->phydev) {	/* SFP with a PHY: Linux runs SGMII via phylib */
+		p->note = "module PHY: phylib keeps its own speed";
+		return 0;
+	}
+	if (!nd->ethtool_ops || !nd->ethtool_ops->set_link_ksettings) {
+		p->note = "no set_link_ksettings";
+		return -EOPNOTSUPP;
+	}
+	ret = __ethtool_get_link_ksettings(nd, &ks);
+	if (ret)
+		return ret;
+	if (!test_bit(mode, ks.link_modes.supported)) {
+		p->note = want_2500 ? "2500base-x not in module caps" : "1000base-x not in module caps";
+		return -EOPNOTSUPP;
+	}
+	if (st_ks_matches(&ks, want_2500))
+		return 0;
+	/* phylink may normalise our request (e.g. copper module): same readback = nothing to redo */
+	if (p->set_seen && ks.base.autoneg == p->set_ks.base.autoneg &&
+	    ks.base.speed == p->set_ks.base.speed &&
+	    linkmode_equal(ks.link_modes.advertising, p->set_ks.link_modes.advertising))
+		return 0;
+
+	ks.base.duplex = DUPLEX_FULL;
+	if (want_2500) {
+		ks.base.autoneg = AUTONEG_DISABLE;
+		ks.base.speed = SPEED_2500;
+		return st_set_ks(nd, &ks) ?: st_set_done(p, nd);
+	}
+	ks.base.autoneg = AUTONEG_ENABLE;
+	linkmode_zero(ks.link_modes.advertising);
+	linkmode_set_bit(ETHTOOL_LINK_MODE_1000baseX_Full_BIT, ks.link_modes.advertising);
+	linkmode_set_bit(ETHTOOL_LINK_MODE_Autoneg_BIT, ks.link_modes.advertising);
+	linkmode_set_bit(ETHTOOL_LINK_MODE_Pause_BIT, ks.link_modes.advertising);
+	linkmode_set_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT, ks.link_modes.advertising);
+	ret = st_set_ks(nd, &ks);
+	if (ret != -EINVAL)
+		return ret ?: st_set_done(p, nd);
+	/* PCS refuses in-band AN on 1000BASE-X: keep the speed, drop AN */
+	p->note = "1000base-x, autoneg off (in-band AN refused)";
+	ks.base.autoneg = AUTONEG_DISABLE;
+	ks.base.speed = SPEED_1000;
+	return st_set_ks(nd, &ks) ?: st_set_done(p, nd);
+}
+
+static void st_apply(struct st_ms *ms, int i)
+{
+	struct st_port *p = &ms->port[i];
+	const char *old_note = p->note;
+	int old_res = p->res, res = 0;
+	struct net_device *nd;
+
+	if (!p->i2c)
+		return;
+	nd = st_netdev(p);
+	if (!nd) {
+		p->ifname[0] = '\0';
+		p->note = "no netdev on this cage";
+		res = -ENODEV;
+		goto out;
+	}
+	strscpy(p->ifname, nd->name);
+	if (p->downed && p->act != ST_ACT_DOWN) {
+		res = dev_change_flags(nd, nd->flags | IFF_UP, NULL);
+		dev_info(ms->dev, "port %d: %s up again (%d)\n", i, p->ifname, res);
+		p->downed = false;
+	}
+	switch (p->act) {
+	case ST_ACT_NONE:
+		p->note = "untouched";
+		break;
+	case ST_ACT_DOWN:
+		p->note = "admin down";
+		if (p->down_done)
+			break;
+		p->down_done = true;
+		if (nd->flags & IFF_UP) {
+			res = dev_change_flags(nd, nd->flags & ~IFF_UP, NULL);
+			p->downed = !res;
+		}
+		break;
+	case ST_ACT_1000X_AN:
+	case ST_ACT_2500X_FORCED:
+		res = st_apply_speed(p, nd);
+		break;
+	}
+out:
+	if (res > 0)
+		dev_info(ms->dev, "port %d: linux %s set %s\n", i, p->ifname, p->note);
+	else if (res != old_res || p->note != old_note)
+		dev_info(ms->dev, "port %d: linux %s %s (%d)\n", i,
+			 p->ifname[0] ? p->ifname : "-", p->note, res);
+	p->res = res > 0 ? 0 : res;
+}
+
+/* Declared power: A0 byte 64 level bits, raised for copper modules (cannot declare > 2.0 W) */
+static unsigned int st_power_mw(const u8 *id, const char **why)
+{
+	unsigned int mw = id[64] & BIT(5) ? 2000 : id[64] & BIT(1) ? 1500 : 1000, cu = 0;
+	u8 ecc = id[36];
+
+	*why = "declared";
+	if (ecc == 0x16 || ecc == 0x1c || ecc == 0x1d)	/* 10GBASE-T SFI/SR, 5GBASE-T */
+		cu = ST_CU_10G_MW;
+	else if (ecc == 0x1e)				/* 2.5GBASE-T */
+		cu = ST_CU_2G5_MW;
+	else if (id[2] == 0x22)				/* RJ45: size by nominal rate */
+		cu = id[12] >= 100 ? ST_CU_10G_MW : id[12] >= 25 ? ST_CU_2G5_MW : ST_CU_1G_MW;
+	else if (id[6] & BIT(3))			/* 1000BASE-T */
+		cu = ST_CU_1G_MW;
+	if (cu > mw) {
+		*why = "copper table";
+		mw = cu;
+	}
+	return mw;
+}
+
+static unsigned int st_power_total(struct st_ms *ms)
+{
+	unsigned int i, mw = 0;
+
+	for (i = 0; i < ST_NPORTS; i++)
+		mw += ms->port[i].present ? ms->port[i].power_mw : 0;
+	return mw;
+}
+
+/* log the total on change; warn once on crossing the budget, info when back under */
+static void st_power_check(struct st_ms *ms)
+{
+	unsigned int total = st_power_total(ms), budget = READ_ONCE(power_budget_mw);
+
+	if (total != ms->power_total_mw)
+		dev_info(ms->dev, "SFP power: %u mW declared, budget %u mW\n", total, budget);
+	ms->power_total_mw = total;
+	if (total > budget && !ms->power_over)
+		dev_warn(ms->dev, "SFP declared total %u.%u W > budget %u.%u W (board input %u W)\n",
+			 total / 1000, total % 1000 / 100, budget / 1000, budget % 1000 / 100,
+			 ST_BOARD_INPUT_MW / 1000);
+	else if (total <= budget && ms->power_over)
+		dev_info(ms->dev, "SFP declared total %u.%u W back within budget %u.%u W\n",
+			 total / 1000, total % 1000 / 100, budget / 1000, budget % 1000 / 100);
+	ms->power_over = total > budget;
+}
+
+/* tpSfpGetType presence + insert/outsert, then tpSfpSetType per event */
+static void st_media_pass(struct st_ms *ms)
+{
+	bool seen[ST_NPORTS] = {}, recheck = false;
+	u8 id[ST_EEPROM_LEN];
+	int i;
+
+	for (i = 0; i < ST_NPORTS; i++) {
+		struct st_port *p = &ms->port[i];
+
+		if (!p->i2c)
+			continue;
+		seen[i] = !st_i2c_probe(p);
+		recheck |= seen[i] && !p->present && !p->unread;
+	}
+	if (recheck)	/* vendor re-reads one port at a time; one sleep covers all */
+		msleep(ST_RECHECK_MS);
+
+	for (i = 0; i < ST_NPORTS; i++) {
+		struct st_port *p = &ms->port[i];
+
+		if (!p->i2c)
+			continue;
+		if (seen[i] && !p->present)
+			seen[i] = !st_i2c_probe(p);
+		if (!seen[i]) {
+			p->unread = false;
+			if (p->present && ++p->misses >= ST_REMOVE_MISSES) {
+				dev_info(ms->dev, "port %d outsert\n", i);
+				p->present = false;
+				p->elec = false;
+				p->cls = ST_CLS_OUT;
+				p->act = ST_ACT_NONE;
+				p->media = 0;
+				p->power_mw = 0;
+			}
+			continue;
+		}
+		p->misses = 0;
+		if (p->present)
+			continue;
+		/* unreadable = not inserted: no power counted, no media decision (#29) */
+		if (st_read_eeprom(p, id)) {
+			if (!p->unread)
+				dev_info(ms->dev, "dev %d eeprom read error, counted empty\n", i);
+			p->unread = true;
+			continue;
+		}
+		p->unread = false;
+		p->present = true;
+		p->cls = st_classify(ms, i, id);
+		p->power_mw = st_power_mw(id, &p->power_why);
+		st_decide(ms, i);
+	}
+
+	st_power_check(ms);
+	rtnl_lock();
+	for (i = 0; i < ST_NPORTS; i++)
+		st_apply(ms, i);
+	rtnl_unlock();
+}
+
+/* check_pattern_thread_func (0x0020c490); returns true on a change */
+static bool st_pattern_pass(struct st_ms *ms)
+{
+	int pat = st_get_pattern(ms), i;
+
+	if (!ms->pattern) {
+		dev_info(ms->dev, "cur pattern = %d\n", pat);
+		dev_info(ms->dev, "pins 17/18/19 = %d/%d/%d, position (pins 18/19) %s\n",
+			 ms->v[0], ms->v[1], ms->v[2], st_position(ms));
+		ms->pattern = pat;
+		st_pattern_set(ms, pat);
+		return false;
+	}
+	if (pat == ms->pattern)
+		return false;
+	/* stock: "pattern changed switch reset" + GPIO21 low; here GPIO21 low = board reset */
+	dev_info(ms->dev, "pattern changed %d -> %d, pins 17/18/19 = %d/%d/%d, position (pins 18/19) %s: re-applying, no switch reset\n",
+		 ms->pattern, pat, ms->v[0], ms->v[1], ms->v[2], st_position(ms));
+	ms->pattern = pat;
+	st_pattern_set(ms, pat);
+	for (i = 0; i < ST_NPORTS; i++) {	/* after its reset, stock re-reads every module */
+		ms->port[i].present = false;
+		ms->port[i].misses = 0;
+	}
+	return true;
+}
+
+static void st_pattern_work(struct work_struct *w)
+{
+	struct st_ms *ms = container_of(to_delayed_work(w), struct st_ms, pattern_work);
+	bool changed;
+
+	mutex_lock(&ms->lock);
+	changed = st_pattern_pass(ms);
+	mutex_unlock(&ms->lock);
+	if (changed)
+		mod_delayed_work(ms->wq, &ms->media_work, 0);
+	queue_delayed_work(ms->wq, &ms->pattern_work, msecs_to_jiffies(ST_PATTERN_POLL_MS));
+}
+
+static void st_media_work(struct work_struct *w)
+{
+	struct st_ms *ms = container_of(to_delayed_work(w), struct st_ms, media_work);
+
+	mutex_lock(&ms->lock);
+	st_media_pass(ms);
+	mutex_unlock(&ms->lock);
+	queue_delayed_work(ms->wq, &ms->media_work, msecs_to_jiffies(ST_MEDIA_POLL_MS));
+}
+
+static int st_state_show(struct seq_file *s, void *unused)
+{
+	struct st_ms *ms = s->private;
+	int i;
+
+	mutex_lock(&ms->lock);
+	seq_printf(s, "pins 17/18/19 = %d/%d/%d\n", ms->v[0], ms->v[1], ms->v[2]);
+	seq_printf(s, "pattern = %d\n", ms->pattern);
+	seq_printf(s, "position (pins 18/19, U-Boot rtk mode) = %s\n", st_position(ms));
+	seq_printf(s, "power: %u mW declared, budget %u mW%s\n", st_power_total(ms),
+		   READ_ONCE(power_budget_mw), ms->power_over ? " (OVER)" : "");
+	seq_puts(s, "port cage pat present class elec media action netdev result power_mw power_src note\n");
+	for (i = 0; i < ST_NPORTS; i++) {
+		struct st_port *p = &ms->port[i];
+
+		if (!p->i2c)
+			continue;
+		seq_printf(s, "%d %d %d %d %d %d %d %s %s %d %u %s %s\n", i, i + 1, p->pat,
+			   p->present, p->cls, p->elec, p->media, st_act_name[p->act],
+			   p->ifname[0] ? p->ifname : "-", p->res, p->present ? p->power_mw : 0,
+			   p->present ? p->power_why : "-",
+			   p->unread ? "eeprom unreadable, counted empty" : p->note ?: "-");
+	}
+	mutex_unlock(&ms->lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(st_state);
+
+static ssize_t power_total_mw_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct st_ms *ms = dev_get_drvdata(dev);
+	unsigned int mw;
+
+	mutex_lock(&ms->lock);
+	mw = st_power_total(ms);
+	mutex_unlock(&ms->lock);
+	return sysfs_emit(buf, "%u\n", mw);
+}
+static DEVICE_ATTR_RO(power_total_mw);
+
+/* per cage 1-8, space separated; 0 = empty */
+static ssize_t power_cage_mw_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct st_ms *ms = dev_get_drvdata(dev);
+	int i, n = 0;
+
+	mutex_lock(&ms->lock);
+	for (i = 0; i < ST_NPORTS; i++)
+		n += sysfs_emit_at(buf, n, "%u%c", ms->port[i].present ? ms->port[i].power_mw : 0,
+				   i == ST_NPORTS - 1 ? '\n' : ' ');
+	mutex_unlock(&ms->lock);
+	return n;
+}
+static DEVICE_ATTR_RO(power_cage_mw);
+
+static ssize_t power_budget_mw_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", READ_ONCE(power_budget_mw));
+}
+
+static ssize_t power_budget_mw_store(struct device *dev, struct device_attribute *attr,
+				     const char *buf, size_t len)
+{
+	struct st_ms *ms = dev_get_drvdata(dev);
+	unsigned int v;
+	int ret = kstrtouint(buf, 0, &v);
+
+	if (ret)
+		return ret;
+	WRITE_ONCE(power_budget_mw, v);
+	mutex_lock(&ms->lock);
+	st_power_check(ms);
+	mutex_unlock(&ms->lock);
+	return len;
+}
+static DEVICE_ATTR_RW(power_budget_mw);
+
+static struct attribute *st_attrs[] = {
+	&dev_attr_power_total_mw.attr,
+	&dev_attr_power_cage_mw.attr,
+	&dev_attr_power_budget_mw.attr,
+	NULL
+};
+ATTRIBUTE_GROUPS(st);
+
+static void st_release(struct st_ms *ms)
+{
+	int i;
+
+	for (i = 0; i < ST_NPORTS; i++) {
+		struct st_port *p = &ms->port[i];
+
+		if (p->i2c)
+			i2c_put_adapter(p->i2c);
+		if (!IS_ERR_OR_NULL(p->bus))
+			sfp_bus_put(p->bus);
+	}
+}
+
+static int st_parse_ports(struct st_ms *ms)
+{
+	struct device *dev = ms->dev;
+
+	for_each_available_child_of_node_scoped(dev->of_node, child) {
+		struct device_node *sfp_np, *i2c_np;
+		struct st_port *p;
+		u32 reg;
+
+		if (of_property_read_u32(child, "reg", &reg) || reg >= ST_NPORTS)
+			return dev_err_probe(dev, -EINVAL, "%pOF: reg 0-7 required\n", child);
+		p = &ms->port[reg];
+		sfp_np = of_parse_phandle(child, "sfp", 0);
+		if (!sfp_np)
+			return dev_err_probe(dev, -EINVAL, "%pOF: sfp phandle required\n", child);
+		i2c_np = of_parse_phandle(sfp_np, "i2c-bus", 0);
+		of_node_put(sfp_np);
+		if (!i2c_np)
+			return dev_err_probe(dev, -EINVAL, "%pOF: sfp has no i2c-bus\n", child);
+		p->i2c = of_get_i2c_adapter_by_node(i2c_np);
+		of_node_put(i2c_np);
+		if (!p->i2c)
+			return -EPROBE_DEFER;
+		p->bus = sfp_bus_find_fwnode(of_fwnode_handle(child));
+		if (IS_ERR(p->bus))
+			return dev_err_probe(dev, PTR_ERR(p->bus), "%pOF: sfp bus\n", child);
+	}
+	return 0;
+}
+
+static int st_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct st_ms *ms;
+	int ret, i;
+
+	ms = devm_kzalloc(dev, sizeof(*ms), GFP_KERNEL);
+	if (!ms)
+		return -ENOMEM;
+	ms->dev = dev;
+	for (i = 0; i < ST_NPINS; i++)
+		ms->v[i] = -1;	/* no sample yet: judges as 3 */
+	ms->power_total_mw = UINT_MAX;	/* first pass logs the total */
+	ms->pins = devm_gpiod_get_array(dev, NULL, GPIOD_IN);
+	if (IS_ERR(ms->pins))
+		return dev_err_probe(dev, PTR_ERR(ms->pins), "mode pins\n");
+	if (ms->pins->ndescs != ST_NPINS)
+		return dev_err_probe(dev, -EINVAL, "need 3 gpios (pins 17/18/19)\n");
+
+	ret = st_parse_ports(ms);
+	if (ret)
+		goto err;
+	ret = devm_mutex_init(dev, &ms->lock);
+	if (ret)
+		goto err;
+	ms->wq = alloc_ordered_workqueue("st1008f-mode", 0);
+	if (!ms->wq) {
+		ret = -ENOMEM;
+		goto err;
+	}
+	INIT_DELAYED_WORK(&ms->pattern_work, st_pattern_work);
+	INIT_DELAYED_WORK(&ms->media_work, st_media_work);
+	platform_set_drvdata(pdev, ms);
+
+	/* first pass in probe: the boot log shows the latch and per-port decisions */
+	mutex_lock(&ms->lock);
+	st_pattern_pass(ms);
+	st_media_pass(ms);
+	mutex_unlock(&ms->lock);
+
+	ms->dbg = debugfs_create_dir("st1008f-mode-switch", NULL);
+	debugfs_create_file("state", 0444, ms->dbg, ms, &st_state_fops);
+	queue_delayed_work(ms->wq, &ms->pattern_work, msecs_to_jiffies(ST_PATTERN_POLL_MS));
+	queue_delayed_work(ms->wq, &ms->media_work, msecs_to_jiffies(ST_MEDIA_POLL_MS));
+	return 0;
+
+err:
+	st_release(ms);
+	return ret;
+}
+
+static void st_remove(struct platform_device *pdev)
+{
+	struct st_ms *ms = platform_get_drvdata(pdev);
+	struct net_device *nd;
+	int i;
+
+	debugfs_remove_recursive(ms->dbg);
+	cancel_delayed_work_sync(&ms->pattern_work);	/* first: it can kick media_work */
+	cancel_delayed_work_sync(&ms->media_work);
+	destroy_workqueue(ms->wq);
+	rtnl_lock();
+	for (i = 0; i < ST_NPORTS; i++) {
+		nd = ms->port[i].downed ? st_netdev(&ms->port[i]) : NULL;
+		if (nd)
+			dev_change_flags(nd, nd->flags | IFF_UP, NULL);
+	}
+	rtnl_unlock();
+	st_release(ms);
+}
+
+static const struct of_device_id st_of_match[] = {
+	{ .compatible = "tplink,st1008f-mode-switch" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, st_of_match);
+
+static struct platform_driver st_driver = {
+	.probe = st_probe,
+	.remove = st_remove,
+	.driver = {
+		.name = "tplink-st1008f-mode",
+		.of_match_table = st_of_match,
+		.dev_groups = st_groups,
+	},
+};
+module_platform_driver(st_driver);
+
+MODULE_DESCRIPTION("TP-Link TL-ST1008F v2 mode switch (stock rtk.ko speed pattern)");
+MODULE_LICENSE("GPL");

@@ -37,4 +37,16 @@ config LS2K_RESET
 	help
 	  Loongson-2K1000 Reset Controller driver.
 
+config TPLINK_ST1008F_MODE_SWITCH
+	tristate "TP-Link TL-ST1008F v2 mode switch"
+	depends on MACH_REALTEK_RTL || COMPILE_TEST
+	depends on OF && GPIOLIB && I2C && NETDEVICES && (HWMON || HWMON=n)
+	select PHYLINK
+	select SFP
+	help
+	  Reads the TL-ST1008F v2 3-position mode switch (GPIO 17-19) like the
+	  stock firmware and applies its 1G/2.5G speed pattern to 1G and 2.5G
+	  SFP modules. 10G modules are not touched. Also sums the power
+	  every fitted module declares and warns over a budget.
+
 endif # MIPS_PLATFORM_DEVICES
