@@ -189,6 +189,20 @@ config MDIO_REALTEK_RTL9300
 	  This driver supports the MDIO interface found in the Realtek
 	  RTL83xx/RTL93xx family of Ethernet switches with integrated SoC.
 
+config MDIO_REALTEK_OTTO
+	tristate "Realtek Otto MDIO interface support"
+	depends on MACH_REALTEK_RTL || COMPILE_TEST
+	depends on MFD_SYSCON
+	help
+	  This driver supports the MDIO bus on RTL83xx/RTL93xx SoCs.
+
+config MDIO_REALTEK_OTTO_SERDES
+	tristate "Realtek Otto MDIO SerDes interface support"
+	depends on MACH_REALTEK_RTL || COMPILE_TEST
+	depends on MFD_SYSCON
+	help
+	  This driver provides MDIO access to the RTL83xx/RTL93xx SerDes.
+
 config MDIO_REGMAP
 	tristate
 	help

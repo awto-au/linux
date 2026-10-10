@@ -187,6 +187,12 @@ config NET_DSA_TAG_RTL8_4
 	  Say Y or M if you want to enable support for tagging frames for Realtek
 	  switches with 8 byte protocol 4 tags, such as the Realtek RTL8365MB-VC.
 
+config NET_DSA_TAG_RTL_OTTO
+	tristate "Tag driver for Realtek Otto switches (RTL83xx/RTL93xx)"
+	help
+	  Say Y or M if you want to enable support for tagging frames for the
+	  Realtek Otto family of switches.
+
 config NET_DSA_TAG_RZN1_A5PSW
 	tristate "Tag driver for Renesas RZ/N1 A5PSW switch"
 	help

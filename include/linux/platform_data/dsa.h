@@ -4,7 +4,7 @@
 
 struct device;
 
-#define DSA_MAX_PORTS		12
+#define DSA_MAX_PORTS		56
 
 struct dsa_chip_data {
 	/*

@@ -6,7 +6,7 @@
 config NET_VENDOR_REALTEK
 	bool "Realtek devices"
 	default y
-	depends on PCI
+	depends on PCI || MACH_REALTEK_RTL
 	help
 	  If you have a network (Ethernet) card belonging to this class, say Y.
 
@@ -125,5 +125,13 @@ config RTASE
 
 	  To compile this driver as a module, choose M here: the module
 	  will be called rtase. This is recommended.
+
+config NET_RTL838X
+	tristate "Realtek Otto (RTL83xx/RTL93xx) switch CPU port Ethernet"
+	depends on MACH_REALTEK_RTL
+	select PAGE_POOL
+	select PHYLINK
+	help
+	  Say Y here if you want to use the Realtek Otto switch SoC CPU port NIC.
 
 endif # NET_VENDOR_REALTEK
