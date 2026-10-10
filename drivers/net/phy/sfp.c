@@ -1005,6 +1005,29 @@ static int sfp_i2c_mdiobus_create(struct sfp *sfp)
 	return 0;
 }
 
+static int sfp_sm_mdiobus_create(struct sfp *sfp)
+{
+	struct mii_bus *sm_mii;
+	int ret;
+
+	sm_mii = mdio_smbus_alloc(sfp->dev, sfp->i2c, sfp->mdio_protocol);
+	if (IS_ERR(sm_mii))
+		return PTR_ERR(sm_mii);
+
+	sm_mii->name = "SFP SMBus";
+	sm_mii->phy_mask = ~0;
+
+	ret = mdiobus_register(sm_mii);
+	if (ret < 0) {
+		mdiobus_free(sm_mii);
+		return ret;
+	}
+
+	sfp->i2c_mii = sm_mii;
+
+	return 0;
+}
+
 static void sfp_i2c_mdiobus_destroy(struct sfp *sfp)
 {
 	mdiobus_unregister(sfp->i2c_mii);
@@ -2223,8 +2246,14 @@ static void sfp_sm_fault(struct sfp *sfp, unsigned int next_state, bool warn)
 
 static int sfp_sm_add_mdio_bus(struct sfp *sfp)
 {
-	if (sfp->mdio_protocol != MDIO_I2C_NONE)
+	if (sfp->mdio_protocol == MDIO_I2C_NONE)
+		return 0;
+
+	if (i2c_check_functionality(sfp->i2c, I2C_FUNC_I2C))
 		return sfp_i2c_mdiobus_create(sfp);
+
+	if (i2c_check_functionality(sfp->i2c, I2C_FUNC_SMBUS_BYTE_DATA))
+		return sfp_sm_mdiobus_create(sfp);
 
 	return 0;
 }
