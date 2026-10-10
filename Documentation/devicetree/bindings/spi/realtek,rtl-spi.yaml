@@ -23,7 +23,16 @@ properties:
       - realtek,rtl8393-spi
 
   reg:
-    maxItems: 1
+    minItems: 1
+    items:
+      - description: controller registers
+      - description: memory-mapped flash read window (spi-mem dirmap)
+
+  reg-names:
+    minItems: 1
+    items:
+      - const: regs
+      - const: dirmap
 
 required:
   - compatible
