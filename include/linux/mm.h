@@ -3258,7 +3258,7 @@ static inline void set_page_address(struct page *page, void *address)
 #endif
 
 #if defined(HASHED_PAGE_VIRTUAL)
-void *page_address(const struct page *page);
+void *page_address_hashed(const struct page *page);
 void set_page_address(struct page *page, void *virtual);
 void page_address_init(void);
 #endif
@@ -3267,6 +3267,16 @@ static __always_inline void *lowmem_page_address(const struct page *page)
 {
 	return page_to_virt(page);
 }
+
+#if defined(HASHED_PAGE_VIRTUAL)
+/* Lowmem inline: only highmem pages need the out-of-line hash lookup. */
+static inline void *page_address(const struct page *page)
+{
+	if (!PageHighMem(page))
+		return lowmem_page_address(page);
+	return page_address_hashed(page);
+}
+#endif
 
 #if !defined(HASHED_PAGE_VIRTUAL) && !defined(WANT_PAGE_VIRTUAL)
 #define page_address(page) lowmem_page_address(page)

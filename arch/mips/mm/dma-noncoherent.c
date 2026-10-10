@@ -7,6 +7,8 @@
 #include <linux/dma-direct.h>
 #include <linux/dma-map-ops.h>
 #include <linux/highmem.h>
+#include <linux/memblock.h>
+#include <linux/pfn.h>
 
 #include <asm/cache.h>
 #include <asm/cpu-type.h>
@@ -95,10 +97,21 @@ static inline void dma_sync_virt_for_cpu(void *addr, size_t size,
 static inline void dma_sync_phys(phys_addr_t paddr, size_t size,
 		enum dma_data_direction dir, bool for_device)
 {
-	struct page *page = pfn_to_page(paddr >> PAGE_SHIFT);
-	unsigned long offset = paddr & ~PAGE_MASK;
+	struct page *page;
+	unsigned long offset;
 	size_t left = size;
 
+	/* Lowmem (every NIC buffer): direct KSEG0 address, no per-page kmap loop. */
+	if (!IS_ENABLED(CONFIG_HIGHMEM) || PFN_DOWN(paddr + size - 1) < max_low_pfn) {
+		if (for_device)
+			dma_sync_virt_for_device(phys_to_virt(paddr), size, dir);
+		else
+			dma_sync_virt_for_cpu(phys_to_virt(paddr), size, dir);
+		return;
+	}
+
+	page = pfn_to_page(paddr >> PAGE_SHIFT);
+	offset = paddr & ~PAGE_MASK;
 	do {
 		size_t len = left;
 		void *addr;

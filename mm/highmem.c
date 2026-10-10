@@ -746,19 +746,17 @@ static struct page_address_slot *page_slot(const struct page *page)
 }
 
 /**
- * page_address - get the mapped virtual address of a page
+ * page_address_hashed - get the mapped virtual address of a highmem page
  * @page: &struct page to get the virtual address of
  *
- * Returns the page's virtual address.
+ * Returns the page's kmap virtual address, NULL if not mapped. Lowmem pages are
+ * handled inline by page_address().
  */
-void *page_address(const struct page *page)
+void *page_address_hashed(const struct page *page)
 {
 	unsigned long flags;
 	void *ret;
 	struct page_address_slot *pas;
-
-	if (!PageHighMem(page))
-		return lowmem_page_address(page);
 
 	pas = page_slot(page);
 	ret = NULL;
@@ -777,7 +775,7 @@ void *page_address(const struct page *page)
 	spin_unlock_irqrestore(&pas->lock, flags);
 	return ret;
 }
-EXPORT_SYMBOL(page_address);
+EXPORT_SYMBOL(page_address_hashed);
 
 /**
  * set_page_address - set a page's virtual address
