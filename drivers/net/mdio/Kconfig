@@ -37,6 +37,17 @@ config MDIO_SUN4I
 	  interface units of the Allwinner SoC that have an EMAC (A10,
 	  A12, A10s, etc.)
 
+config MDIO_SMBUS
+	tristate
+	depends on I2C_SMBUS
+	help
+	  Support SMBus based PHYs. This provides a MDIO bus bridged
+	  to SMBus to allow PHYs connected in SMBus mode to be accessed
+	  using the existing infrastructure.
+
+	  This is library mode.
+
+
 config MDIO_XGENE
 	tristate "APM X-Gene SoC MDIO bus controller"
 	depends on ARCH_XGENE || COMPILE_TEST
