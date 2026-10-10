@@ -6,6 +6,7 @@
 #include <linux/cacheflush.h>
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
+#include <linux/genalloc.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/mfd/syscon.h>
@@ -29,6 +30,11 @@
 #include <net/page_pool/helpers.h>
 
 #include "rtl838x_eth.h"
+
+/* RX/TX rings + frags in on-chip SRAM (DT `sram` phandle, RTL930x; NIC DMA reaches it, #103) */
+static uint sram_rings;
+module_param(sram_rings, uint, 0444);
+MODULE_PARM_DESC(sram_rings, "descriptor rings in the DT sram pool: bit 0 RX, bit 1 TX");
 
 /* RTL930x NIC core shared with U-Boot (awto-tl-st1008f shared/rtl930x-nic, #83); ctx = regmap */
 static inline u32 rtl930x_nic_rd(void *ctx, u32 off)
@@ -1855,13 +1861,28 @@ static int rteth_probe(struct platform_device *pdev)
 	if (err)
 		return err;
 
-	ctrl->rx_data = dmam_alloc_coherent(&pdev->dev, sizeof(struct rteth_rx_data) * RTETH_RX_RINGS,
-					    &ctrl->rx_dma, GFP_KERNEL);
+	if (sram_rings) {
+		struct gen_pool *pool = of_gen_pool_get(dn, "sram", 0);
+
+		/* SRAM is mapped uncached (mmio-sram no-memory-wc): same access semantics as coherent DDR */
+		if (pool && (sram_rings & 1))
+			ctrl->rx_data = gen_pool_dma_zalloc(pool, sizeof(struct rteth_rx_data) * RTETH_RX_RINGS,
+							    &ctrl->rx_dma);
+		if (pool && (sram_rings & 2))
+			ctrl->tx_data = gen_pool_dma_zalloc(pool, sizeof(struct rteth_tx_data) * RTETH_TX_RINGS,
+							    &ctrl->tx_dma);
+		dev_info(&pdev->dev, "sram_rings %u: rx %s, tx %s\n", sram_rings,
+			 ctrl->rx_data ? "SRAM" : "DDR", ctrl->tx_data ? "SRAM" : "DDR");
+	}
+	if (!ctrl->rx_data)
+		ctrl->rx_data = dmam_alloc_coherent(&pdev->dev, sizeof(struct rteth_rx_data) * RTETH_RX_RINGS,
+						    &ctrl->rx_dma, GFP_KERNEL);
 	if (!ctrl->rx_data)
 		return dev_err_probe(&pdev->dev, -ENOMEM, "failed to allocate RX ring memory\n");
 
-	ctrl->tx_data = dmam_alloc_coherent(&pdev->dev, sizeof(struct rteth_tx_data) * RTETH_TX_RINGS,
-					    &ctrl->tx_dma, GFP_KERNEL);
+	if (!ctrl->tx_data)
+		ctrl->tx_data = dmam_alloc_coherent(&pdev->dev, sizeof(struct rteth_tx_data) * RTETH_TX_RINGS,
+						    &ctrl->tx_dma, GFP_KERNEL);
 	if (!ctrl->tx_data)
 		return dev_err_probe(&pdev->dev, -ENOMEM, "failed to allocate TX ring memory\n");
 
