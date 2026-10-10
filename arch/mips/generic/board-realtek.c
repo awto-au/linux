@@ -30,6 +30,10 @@
 #define RTL9300_MCR			0x1000
 #define RTL9300_MCR_IPREF		BIT(23)
 #define RTL9300_MCR_DPREF		BIT(22)
+#define RTL9300_SRAM_BUS		0x1f000000
+#define RTL9300_SEG_EN			BIT(0)
+#define RTL9300_SEG_SIZE_64K		9
+#define RTL9300_SRAMSBR0_PLR		0x00030000
 
 #define RTL931X_DRAM_CONFIG		0x14304c
 
@@ -319,6 +323,26 @@ static void rtl930x_prepare_highmem(void)
 	__sync();
 }
 
+/*
+ * 64 KiB on-chip SRAM at bus 0x1f000000 (DT mmio-sram node), outside zones 1-3; re-set after
+ * the highmem remap above, which clears it. SRAM segment only: the PLR's unmap segment
+ * (UMSAR0) matches the DRAM address after zone translation, so on a 512 MiB board it would
+ * punch a hole at phys 0x2f000000 whose accesses hang (#107). Enable last.
+ */
+static void __init rtl930x_map_sram(void)
+{
+	soc_w32(RTL9300_SEG_SIZE_64K, RTL9300_SRAMSAR0 + 4);
+	soc_w32(RTL9300_SRAMSBR0_PLR, RTL9300_SRAMSAR0 + 8);
+	soc_w32(RTL9300_SRAM_BUS | RTL9300_SEG_EN, RTL9300_SRAMSAR0);
+	__sync();
+}
+
+static void __init rtl930x_prepare_memory(void)
+{
+	rtl930x_prepare_highmem();
+	rtl930x_map_sram();
+}
+
 static void __init realtek_prom_init(const void *match_data)
 {
 	const struct realtek_soc_data *cfg = match_data;
@@ -452,7 +476,7 @@ static const struct realtek_soc_data rtl930x_soc __initconst = {
 	.apply_quirks = rtl930x_apply_quirks,
 	.read_details = rtl93xx_read_details,
 	.get_memory = realtek_get_system_memory,
-	.prepare_highmem = rtl930x_prepare_highmem,
+	.prepare_highmem = rtl930x_prepare_memory,
 };
 
 static const struct realtek_soc_data rtl931x_soc __initconst = {
