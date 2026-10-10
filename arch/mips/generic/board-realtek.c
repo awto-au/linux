@@ -422,6 +422,8 @@ static __init const void *realtek_fixup_fdt(const void *fdt, const void *match_d
 	if (err)
 		panic("Unable to fixup FDT: %d", err);
 
+	arcs_cmdline[0] = '\0';	/* plat_mem_setup() runs fw_init_cmdline() again */
+
 	return fdt_buf;
 
 }
