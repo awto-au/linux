@@ -279,6 +279,8 @@ static int otto_wdt_probe(struct platform_device *pdev)
 	struct otto_wdt_ctrl *ctrl;
 	unsigned int max_tick_ms;
 	void __iomem *base;
+	bool running;
+	u32 v;
 	int ret;
 
 	ctrl = devm_kzalloc(dev, sizeof(*ctrl), GFP_KERNEL);
@@ -300,6 +302,12 @@ static int otto_wdt_probe(struct platform_device *pdev)
 	ret = otto_wdt_probe_clk(ctrl);
 	if (ret)
 		return ret;
+
+	/* Armed by the boot loader (ST1008F default boot, #73): keep it, the core pings until userspace */
+	regmap_read(ctrl->regmap, OTTO_WDT_REG_CTRL, &v);
+	running = v & OTTO_WDT_CTRL_ENABLE;
+	if (running)
+		otto_wdt_ping(&ctrl->wdev);
 
 	/* Clear any old interrupts and reset initial state */
 	regmap_write(ctrl->regmap, OTTO_WDT_REG_INTR,
@@ -340,6 +348,13 @@ static int otto_wdt_probe(struct platform_device *pdev)
 	ret = otto_wdt_determine_timeouts(&ctrl->wdev, ctrl->wdev.timeout, 1);
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to set timeout\n");
+
+	if (running) {
+		otto_wdt_start(&ctrl->wdev);
+		otto_wdt_ping(&ctrl->wdev);
+		set_bit(WDOG_HW_RUNNING, &ctrl->wdev.status);
+		dev_info(dev, "running at probe: kept, %u s timeout\n", ctrl->wdev.timeout);
+	}
 
 	return devm_watchdog_register_device(dev, &ctrl->wdev);
 }
