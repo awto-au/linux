@@ -27,6 +27,9 @@
 #define RTL9300_UMSAR3			0x1330
 #define RTL9300_O0DOR2			0x4220
 #define RTL9300_O0DMAR2			0x4224
+#define RTL9300_MCR			0x1000
+#define RTL9300_MCR_IPREF		BIT(23)
+#define RTL9300_MCR_DPREF		BIT(22)
 
 #define RTL931X_DRAM_CONFIG		0x14304c
 
@@ -228,6 +231,21 @@ static void rtl931x_get_system_memory(void)
 	soc_info.memory_size = 1 << bits;
 }
 
+/*
+ * The DRAM controller's instruction/data prefetch (MCR IP_REF/DP_REF) is left off by the
+ * bootloader. With it on, cached reads and writes stop waiting on one line fill at a time.
+ * Same enable sequence as the Realtek DRAM test: clear, then set.
+ */
+static void __init rtl930x_apply_quirks(void)
+{
+	u32 mcr = soc_r32(RTL9300_MCR) & ~(RTL9300_MCR_IPREF | RTL9300_MCR_DPREF);
+
+	soc_w32(mcr, RTL9300_MCR);
+	soc_w32(mcr | RTL9300_MCR_IPREF | RTL9300_MCR_DPREF, RTL9300_MCR);
+	__sync();
+	pr_info("RTL930x DRAM controller prefetch on (MCR %08x)\n", soc_r32(RTL9300_MCR));
+}
+
 static void rtl930x_prepare_highmem(void)
 {
 	if ((soc_info.memory_size <= 256 * 1024 * 1024) ||
@@ -408,6 +426,7 @@ static const struct realtek_soc_data rtl930x_soc __initconst = {
 	.model_info_reg = RTL93XX_MODEL_NAME_INFO,
 	.family = RTL9300_FAMILY_ID,
 	.cpu_port = RTL930X_CPU_PORT,
+	.apply_quirks = rtl930x_apply_quirks,
 	.read_details = rtl93xx_read_details,
 	.get_memory = realtek_get_system_memory,
 	.prepare_highmem = rtl930x_prepare_highmem,
