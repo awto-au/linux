@@ -506,6 +506,7 @@ struct rtl838x_switch_priv {
 	struct otto_l3_ctrl *l3_ctrl;
 	u64 irq_mask;
 	struct dentry *dbgfs_dir;
+	struct rtldsa_storm *storm;	/* storm.c (#111) */
 
 	/** @lags_port_members: Port (bit) is part of a specific LAG */
 	u64 lags_port_members[MAX_LAGS];

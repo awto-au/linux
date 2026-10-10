@@ -21,6 +21,7 @@
 #include "rtl-otto.h"
 #include "tc.h"
 #include "stp.h"
+#include "storm.h"
 
 /* Port register accessor functions for the RTL838x and RTL930X SoCs */
 void rtl838x_mask_port_reg(u64 clear, u64 set, int reg)
@@ -440,6 +441,7 @@ static int rtl83xx_sw_probe(struct platform_device *pdev)
 	case RTL9300_FAMILY_ID:
 	case RTL9310_FAMILY_ID:
 		rtl930x_dbgfs_init(priv);
+		rtldsa_930x_storm_init(priv);	/* 930x only; after dbgfs_dir */
 		break;
 	}
 
@@ -475,6 +477,7 @@ static void rtl83xx_sw_remove(struct platform_device *pdev)
 	 * when they are getting shut down.
 	 */
 	otto_l3_remove(priv);
+	rtldsa_930x_storm_remove(priv);
 	cancel_delayed_work_sync(&priv->counters_work);
 
 	dsa_switch_shutdown(priv->ds);
