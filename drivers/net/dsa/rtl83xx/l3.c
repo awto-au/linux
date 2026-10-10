@@ -2948,9 +2948,9 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	 */
 	port = otto_l3_port_dev_lower_find(ndev, ctrl);
 	if (port < 0) {
-		dev_err(ctrl->dev, "lower interface %s not found\n", ndev->name);
+		dev_dbg(ctrl->dev, "route on %s: no switch port below, CPU-trapped\n", ndev->name);
 		otto_l3_fib_trap_v4(ctrl, info);
-		return -ENODEV;
+		return 0;
 	}
 
 	/* Allocate route or host-route entry (if hardware supports this) */
