@@ -111,7 +111,8 @@ static int otto_wdt_determine_timeouts(struct watchdog_device *wdev, unsigned in
 {
 	struct otto_wdt_ctrl *ctrl = watchdog_get_drvdata(wdev);
 	unsigned int pretimeout_ms = pretimeout * 1000;
-	unsigned int timeout_ms = timeout * 1000;
+	/* above the hardware maximum the core pings: program the maximum, not -EINVAL */
+	unsigned int timeout_ms = min(timeout * 1000, wdev->max_hw_heartbeat_ms);
 	unsigned int prescale_next = 0;
 	unsigned int phase1_ticks;
 	unsigned int phase2_ticks;
