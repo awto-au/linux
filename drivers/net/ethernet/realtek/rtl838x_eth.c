@@ -1589,12 +1589,22 @@ static void rteth_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *
 	}
 }
 
+/*
+ * Pick the TX ring without the default skb_tx_hash() (flow dissect + siphash per packet):
+ * control-priority frames on ring 1, everything else on ring 0 (#65, docs/NAT.md).
+ */
+static u16 rteth_select_queue(struct net_device *dev, struct sk_buff *skb, struct net_device *sb_dev)
+{
+	return skb->priority >= TC_PRIO_CONTROL ? 1 : 0;
+}
+
 static const struct net_device_ops rteth_netdev_ops = {
 	.ndo_get_stats64	= rteth_get_stats64,
 	.ndo_open		= rteth_open,
 	.ndo_stop		= rteth_stop,
 	.ndo_change_mtu		= rteth_change_mtu,
 	.ndo_start_xmit		= rteth_start_xmit,
+	.ndo_select_queue	= rteth_select_queue,
 	.ndo_set_mac_address	= rteth_set_mac_address,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_set_rx_mode	= rteth_set_rx_mode,
