@@ -191,10 +191,14 @@
 
 #define RTETH_RX_RING_SIZE			128
 #define RTETH_RX_RINGS				2
-/* SDK value (#16); was 16 */
-#define RTETH_TX_RING_SIZE			32
+/* two RX polls of forwarded frames: the 1G CPU port drains a poll's burst slower than the
+ * next poll arrives (#60); was 16, SDK 32
+ */
+#define RTETH_TX_RING_SIZE			128
 /* free slots before a stopped TX queue is woken */
-#define RTETH_TX_WAKE_THRESH			4
+#define RTETH_TX_WAKE_THRESH			16
+/* doorbell at least every this many frames of an xmit_more batch, so the DMA starts early */
+#define RTETH_TX_KICK_BATCH			16
 #define RTETH_TX_RINGS				2
 #define RTETH_TX_TRIGGER(ctrl, ring)		((0x16 >> ring) & ctrl->cfg->tx_trigger_mask)
 
@@ -265,6 +269,9 @@ struct rteth_rx_info {
 struct rteth_tx_info {
 	unsigned int		send_count;  /* skbs handed to the hardware */
 	unsigned int		clean_count; /* skbs released after completion */
+	unsigned int		kick_count;  /* send_count at the last doorbell */
+	unsigned long		packets;     /* under the txq lock (xmit) */
+	unsigned long		bytes;
 	struct sk_buff		*skb[RTETH_TX_RING_SIZE];
 };
 
@@ -291,6 +298,10 @@ struct rteth_ctrl {
 	struct rteth_tx_info	tx_info[RTETH_TX_RINGS];
 	struct rteth_tx_data	*tx_data;
 	struct work_struct	reset_work;
+	/* switch block, for the lockless RTL930x doorbell */
+	void __iomem		*base;
+	/* DMA_IF_CTRL with the fetch and busy bits clear (RTL930x) */
+	u32			dma_if_ctrl_val;
 };
 
 struct rteth_cfg {
@@ -330,6 +341,7 @@ struct rteth_cfg {
 	void (*set_max_packet_length)(struct rteth_ctrl *ctrl, int len);
 	void (*update_counter)(struct rteth_ctrl *ctrl, int ring, int released);
 	void (*set_rx_mode)(struct net_device *dev);
+	void (*tx_kick)(struct rteth_ctrl *ctrl, int ring);
 	u32 rx_csum_mask;
 };
 
