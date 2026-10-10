@@ -1203,9 +1203,32 @@ static int rteth_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	return NETDEV_TX_OK;
 }
 
-static struct sk_buff *rteth_create_skb(struct rteth_ctrl *ctrl, int ring, int slot)
+/*
+ * RX descriptor for reading: one 32 B line, written only by the NIC (the CPU writes `dma` through
+ * the uncached alias, never the cached one). Invalidate + cached read = one line fill instead of
+ * one uncached DDR load per field (#65). A ring outside KSEG1 (remapped) is read uncached as before.
+ */
+static struct rteth_frag *rteth_rx_frag_ptr(struct rteth_ctrl *ctrl, int ring, int slot)
 {
 	struct rteth_frag *frag = &ctrl->rx_data[ring].frag[slot];
+
+	if (IS_ENABLED(CONFIG_DMA_NONCOHERENT) && KSEGX(frag) == KSEG1)
+		return (struct rteth_frag *)CKSEG0ADDR(frag);
+	return frag;
+}
+
+static struct rteth_frag *rteth_rx_frag(struct rteth_ctrl *ctrl, int ring, int slot)
+{
+	struct rteth_frag *frag = rteth_rx_frag_ptr(ctrl, ring, slot);
+
+	if (frag != &ctrl->rx_data[ring].frag[slot])
+		dma_cache_inv((unsigned long)frag, sizeof(*frag));
+	return frag;
+}
+
+static struct sk_buff *rteth_create_skb(struct rteth_ctrl *ctrl, int ring, int slot)
+{
+	struct rteth_frag *frag = rteth_rx_frag_ptr(ctrl, ring, slot);
 	unsigned int offset = ctrl->rx_info[ring].offset[slot];
 	struct page *page = ctrl->rx_info[ring].page[slot];
 	struct page_pool *pool = ctrl->rx_info[ring].pool;
@@ -1244,7 +1267,7 @@ static struct sk_buff *rteth_create_skb(struct rteth_ctrl *ctrl, int ring, int s
 
 static int rteth_append_skb(struct sk_buff *skb, struct rteth_ctrl *ctrl, int ring, int slot)
 {
-	struct rteth_frag *frag = &ctrl->rx_data[ring].frag[slot];
+	struct rteth_frag *frag = rteth_rx_frag_ptr(ctrl, ring, slot);
 	unsigned int offset = ctrl->rx_info[ring].offset[slot];
 	struct page *page = ctrl->rx_info[ring].page[slot];
 	unsigned int nr_frags = skb_shinfo(skb)->nr_frags;
@@ -1288,7 +1311,7 @@ static int rteth_hw_receive(struct net_device *dev, int ring, int budget)
 		if (packet_dma & RTETH_RING_OWN_HW)
 			break;
 
-		frag = &ctrl->rx_data[ring].frag[slot];
+		frag = rteth_rx_frag(ctrl, ring, slot);
 		len = frag->len;
 		is_head = is_tail;
 		is_tail = !frag->more;
@@ -1343,8 +1366,8 @@ static int rteth_hw_receive(struct net_device *dev, int ring, int budget)
 
 		rx_info->page[slot] = new_page;
 		rx_info->offset[slot] = new_offset;
-		frag->dma = page_pool_get_dma_addr(new_page) +
-			    new_offset + ctrl->cfg->skb_headroom;
+		ctrl->rx_data[ring].frag[slot].dma = page_pool_get_dma_addr(new_page) +
+						     new_offset + ctrl->cfg->skb_headroom;
 recycle:
 		dma_wmb();
 		ctrl->rx_data[ring].ring[slot] = packet_dma | RTETH_RING_OWN_HW;
