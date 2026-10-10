@@ -20,6 +20,8 @@ struct fib6_info;
 #define SWITCH_MAC_FREE 0xfffffffffffeULL
 #define MAX_HOST_ROUTES		1536
 #define MAX_ROUTES		512
+/* Host table slots: 2 tables x 512 rows x 6 slots */
+#define MAX_HOST_SLOTS		6144
 
 #define HASH_PICK(val, lsb, len) ((val & (((1 << len) - 1) << lsb)) >> lsb)
 
@@ -92,6 +94,8 @@ struct otto_l3_route {
 	struct in6_addr dst_ip6;
 	int prefix_len;			/* Network prefix len of the destination net */
 	bool is_host_route;
+	bool neigh;			/* host route for an on-link neighbour, no FIB entry */
+	bool hw_missing;		/* no entry could be taken for it */
 	bool replaced;			/* torn down for a route to the same destination */
 	int id;				/* ID number of this route */
 	int row;			/* Row it occupies in the prefix route table */
@@ -129,6 +133,7 @@ struct otto_l3_config {
 	u64 (*get_egress_mac)(struct otto_l3_ctrl *ctrl, u32 idx);
 	int (*set_egress_mac)(struct otto_l3_ctrl *ctrl, u32 idx, u64 mac);
 	int (*set_dmac)(struct otto_l3_ctrl *ctrl, u32 idx, const struct otto_l3_dmac *dmac);
+	void (*host_route_read)(struct otto_l3_ctrl *ctrl, int idx, struct otto_l3_route *rt);
 	void (*host_route_write)(struct otto_l3_ctrl *ctrl, int idx, struct otto_l3_route *rt);
 	void (*get_router_mac)(struct otto_l3_ctrl *ctrl, u32 idx, struct otto_l3_router_mac *m);
 	void (*set_router_mac)(struct otto_l3_ctrl *ctrl, u32 idx, struct otto_l3_router_mac *m);
@@ -156,6 +161,10 @@ struct otto_l3_ctrl {
 	struct delayed_work resync_work;
 	unsigned int resync_delay;
 	bool resync_wanted;
+	struct delayed_work poll_work;	/* neighbour refresh, see otto_l3_poll() */
+	bool onlink_on;		/* l3_onlink as the last poll saw it */
+	bool lost[2];		/* an IPv4 / IPv6 route got no entry and is not tracked */
+	DECLARE_BITMAP(host_slots, MAX_HOST_SLOTS);	/* host table slots in use */
 	struct list_head routes_list;
 	struct list_head rmac_devs;	/* devices router MACs follow */
 	unsigned long route_use_bm[MAX_ROUTES / 32];

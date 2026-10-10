@@ -53,6 +53,20 @@
  * takes another for as long as a route out of it holds one, its on-link
  * prefix included.
  *
+ * Two RTL930x extensions are off by default, since what the switch routes
+ * bypasses the firewall and NAT (module parameters):
+ * - l3_onlink: a resolved neighbour the kernel reaches on-link through a
+ *   switch port gets a host entry forwarding to its MAC (IPv4 and IPv6, host
+ *   table). It follows the neighbour and goes when the neighbour does, when a
+ *   route takes its address over, or when no slot is free (then it traps).
+ * - l3_default_v4, l3_default_v6: a default route of that family through a
+ *   gateway gets a row above the catch-all. It traps while a route of its
+ *   family has no entry, which a forwarding default row would otherwise send
+ *   to the gateway. Leave v4 off where the CPU NATs to the internet.
+ * A poll every DELAY_PROBE_TIME refreshes stale neighbours that the switch
+ * forwards to (entry hit bit) and retries next hops still waiting for an L2
+ * entry.
+ *
  * State per family:
  * - RTL930x: IPv4 and IPv6 unicast routes through a gateway are forwarded.
  *   The prefix table has 512 rows shared by both families; an IPv6 entry
@@ -62,10 +76,10 @@
  *   device outside the switch, a nexthop object or a lightweight tunnel,
  *   multipath routes, IPv4 routes for one DSCP value and, for IPv6,
  *   source-specific and RA-learnt routes.
- *   Default routes have no entry, so their packets reach the CPU through the
- *   catch-all rows. Multicast routing is not offloaded, and all egress
- *   interfaces share one 1536 byte MTU. The programmed state is shown in
- *   debugfs, under realtek_otto_l3.
+ *   Default routes trap through a row of their own, or forward with
+ *   l3_default_v4/v6; without one, the catch-all rows trap. Multicast
+ *   routing is not offloaded, and all egress interfaces share one 1536 byte
+ *   MTU. The programmed state is shown in debugfs, under realtek_otto_l3.
  * - RTL839x: IPv4 and IPv6 unicast routes through a gateway are forwarded,
  *   through the first 512 PIE rules, with the MAC of the device they go out
  *   of. IPv4 rules run up from the second rule, IPv6 ones down from the
@@ -83,12 +97,15 @@
 #include <linux/inet.h>
 #include <linux/inetdevice.h>
 #include <linux/iopoll.h>
+#include <linux/moduleparam.h>
 #include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/seq_file.h>
 #include <net/arp.h>
 #include <net/fib_notifier.h>
+#include <net/ip_fib.h>
 #include <net/ip6_fib.h>
+#include <net/ip6_route.h>
 #include <net/ndisc.h>
 #include <net/netevent.h>
 #include <net/nexthop.h>
@@ -133,6 +150,28 @@
 
 #define DEFAULT_MTU 1536
 #define L3_EGRESS_DMACS 2048
+
+/* Read when a decision is taken; a change reaches the tables at the next poll */
+static bool l3_onlink;
+module_param(l3_onlink, bool, 0644);
+MODULE_PARM_DESC(l3_onlink,
+		 "RTL930x: route to on-link neighbours in hardware, bypassing firewall and NAT");
+
+/* Per family: IPv4 to the internet usually needs NAT, which the switch lacks */
+static bool l3_default_v4;
+module_param(l3_default_v4, bool, 0644);
+MODULE_PARM_DESC(l3_default_v4,
+		 "RTL930x: forward the IPv4 default route in hardware, bypassing firewall and NAT");
+
+static bool l3_default_v6;
+module_param(l3_default_v6, bool, 0644);
+MODULE_PARM_DESC(l3_default_v6,
+		 "RTL930x: forward the IPv6 default route in hardware, bypassing firewall");
+
+static bool otto_l3_default_on(bool v6)
+{
+	return v6 ? READ_ONCE(l3_default_v6) : READ_ONCE(l3_default_v4);
+}
 
 struct otto_l3_net_event_work {
 	struct work_struct work;
@@ -364,6 +403,26 @@ static u32 otto_l3_930x_hash4(u32 ip, int algorithm, bool move_dip)
 	return hash;
 }
 
+/* Both SDK algorithms (_dal_longan_l3_hostHash0/1_ret()) fold an IPv6 address
+ * as the IPv4 hash of its low 32 bits XOR every higher bit i at position i % 9.
+ * Checked against the SDK formulas by scripts/l3_hash6_check.py.
+ */
+static u32 otto_l3_930x_hash6(const struct in6_addr *ip, int algorithm)
+{
+	u32 hash = otto_l3_930x_hash4(be32_to_cpu(ip->s6_addr32[3]), algorithm, false);
+
+	for (int w = 0; w < 3; w++) {
+		u32 v = be32_to_cpu(ip->s6_addr32[w]);
+		int base = 32 * (3 - w);
+
+		for (int j = 0; j < 32; j++)
+			if (v & BIT(j))
+				hash ^= BIT((base + j) % 9);
+	}
+
+	return hash;
+}
+
 /*
  * Get the Destination-MAC of an L3 egress interface or the Source MAC for routed packets
  * from the SoC's L3_EGR_INTF_MAC table. Indexes 0-2047 are DMACs, 2048+ are SMACs
@@ -397,6 +456,12 @@ static int otto_l3_930x_set_dmac(struct otto_l3_ctrl *ctrl, u32 idx,
 {
 	return otto_l3_930x_set_egress_mac(ctrl, idx, dmac->mac);
 }
+
+/* Slots one entry occupies, by type: IPv4 unicast, IPv4 multicast, IPv6
+ * unicast, IPv6 multicast. They come from the SDK allocator rather than from
+ * the entry size, which does not imply them.
+ */
+static const u8 otto_l3_930x_slot_widths[] = { 1, 2, 3, 6 };
 
 /* Decode a host route entry fetched into @data. Returns false unless it is a
  * valid unicast entry; valid is set for any entry, type for any valid one.
@@ -460,6 +525,7 @@ static void otto_l3_930x_host_route_read(struct otto_l3_ctrl *ctrl, int idx, str
 static void otto_l3_930x_host_route_write(struct otto_l3_ctrl *ctrl, int idx, struct otto_l3_route *rt)
 {
 	/* Only the unicast layout is handled below */
+	int slot = idx;
 	u32 data[5];
 	u32 v;
 
@@ -503,13 +569,17 @@ static void otto_l3_930x_host_route_write(struct otto_l3_ctrl *ctrl, int idx, st
 	}
 
 	otto_table_write(RTL9300_TBL_L3_HOST_ROUTE_IPUC, idx, &data);
+
+	if (rt->attr.valid)
+		bitmap_set(ctrl->host_slots, slot, otto_l3_930x_slot_widths[rt->attr.type & 0x3]);
+	else
+		bitmap_clear(ctrl->host_slots, slot, otto_l3_930x_slot_widths[rt->attr.type & 0x3]);
 }
 
-/* Slots one entry occupies, by type: IPv4 unicast, IPv4 multicast, IPv6
- * unicast, IPv6 multicast. They come from the SDK allocator rather than from
- * the entry size, which does not imply them.
- */
-static const u8 otto_l3_930x_slot_widths[] = { 1, 2, 3, 6 };
+static bool otto_l3_930x_slots_busy(struct otto_l3_ctrl *ctrl, int idx, int width)
+{
+	return find_next_bit(ctrl->host_slots, idx + width, idx) < idx + width;
+}
 
 static int otto_l3_930x_find_slot(struct otto_l3_ctrl *ctrl, struct otto_l3_route *rt, bool must_exist)
 {
@@ -521,7 +591,10 @@ static int otto_l3_930x_find_slot(struct otto_l3_ctrl *ctrl, struct otto_l3_rout
 
 	for (int t = 0; t < 2; t++) {
 		algorithm = (sw_r32(RTL930X_L3_HOST_TBL_CTRL) >> (2 + t)) & 0x1;
-		hash = otto_l3_930x_hash4(rt->dst_ip, algorithm, false);
+		if (rt->attr.type == ROUTE_TYPE_IP6UC)
+			hash = otto_l3_930x_hash6(&rt->dst_ip6, algorithm);
+		else
+			hash = otto_l3_930x_hash4(rt->dst_ip, algorithm, false);
 
 		dev_dbg(ctrl->dev, "table %d, algorithm %d, hash %04x\n", t, algorithm, hash);
 
@@ -530,6 +603,12 @@ static int otto_l3_930x_find_slot(struct otto_l3_ctrl *ctrl, struct otto_l3_rout
 			dev_dbg(ctrl->dev, "physical address %d\n", addr);
 			idx = ((addr / 8) * 6) + (addr % 8);
 			dev_dbg(ctrl->dev, "logical address %d\n", idx);
+
+			/* Only the first slot of a wider entry reads back as one,
+			 * so the slots the others cover are tracked here
+			 */
+			if (!must_exist && otto_l3_930x_slots_busy(ctrl, idx, slot_width))
+				continue;
 
 			otto_l3_930x_host_route_read(ctrl, idx, &route_entry);
 			dev_dbg(ctrl->dev, "route valid %d, route dest: %pI4, hit %d\n",
@@ -1368,6 +1447,24 @@ static int otto_l3_prefix_rows(struct otto_l3_ctrl *ctrl, u8 type, int min_len)
 	return n;
 }
 
+/* The catch-all row is the only prefix route no table owns */
+static bool otto_l3_is_catch_all(const struct otto_l3_route *q)
+{
+	return !q->is_host_route && !q->tb_id && !q->prefix_len;
+}
+
+static int otto_l3_catch_alls(struct otto_l3_ctrl *ctrl, u8 type)
+{
+	struct otto_l3_route *q;
+	int n = 0;
+
+	list_for_each_entry(q, &ctrl->routes_list, list)
+		if (q->row >= 0 && q->attr.type == type && otto_l3_is_catch_all(q))
+			n++;
+
+	return n;
+}
+
 /* A row move that fails partway leaves the block half shifted: some rows have
  * moved, and the list still names the rows they were at. Every placement and
  * every compaction after that is computed from those names, so the next route
@@ -1409,6 +1506,10 @@ static int otto_l3_route_place(struct otto_l3_ctrl *ctrl, struct otto_l3_route *
 	below = otto_l3_prefix_rows(ctrl, r->attr.type,
 				    r->prefix_len + (r->tb_id == RT_TABLE_LOCAL));
 	rows = otto_l3_prefix_rows(ctrl, r->attr.type, 0);
+
+	/* A default route goes above the catch-all, which stays last */
+	if (!r->prefix_len && r->tb_id && r->tb_id != RT_TABLE_LOCAL)
+		below -= otto_l3_catch_alls(ctrl, r->attr.type);
 
 	if (r->attr.type == ROUTE_TYPE_IP6UC) {
 		int v4_rows = otto_l3_prefix_rows(ctrl, ROUTE_TYPE_IP4UC, 0);
@@ -1587,6 +1688,34 @@ static bool otto_l3_fwd_off(struct otto_l3_ctrl *ctrl, u8 type)
 	return type == ROUTE_TYPE_IP6UC ? ctrl->v6_fwd_off : ctrl->v4_fwd_off;
 }
 
+static bool otto_l3_is_default(const struct otto_l3_route *r)
+{
+	return !r->is_host_route && !r->prefix_len && r->tb_id == RT_TABLE_MAIN;
+}
+
+/* A forwarding default row takes every destination no other row holds, so it
+ * forwards only while every route of its family has its entry: one the driver
+ * could not place would otherwise go to the default gateway.
+ */
+static bool otto_l3_default_held(struct otto_l3_ctrl *ctrl, struct otto_l3_route *r)
+{
+	struct otto_l3_route *q;
+	bool v6;
+
+	if (!otto_l3_is_default(r))
+		return false;
+
+	v6 = r->attr.type == ROUTE_TYPE_IP6UC;
+	if (!ctrl->cfg->use_l3_tables || !otto_l3_default_on(v6) || ctrl->lost[v6])
+		return true;
+
+	list_for_each_entry(q, &ctrl->routes_list, list)
+		if (q->hw_missing && !q->neigh && q->tb_id && q->attr.type == r->attr.type)
+			return true;
+
+	return false;
+}
+
 /* The kernel looks the local table up whole before main, so a local prefix
  * shorter than a host address (AnyIP: ip route add local ... table local)
  * takes the destinations of a longer main route inside it, which the switch,
@@ -1670,6 +1799,8 @@ static int otto_l3_route_install(struct otto_l3_ctrl *ctrl, struct otto_l3_route
 	char dst[INET6_ADDRSTRLEN + sizeof("/128")];
 	int slot;
 
+	r->hw_missing = false;
+
 	if (otto_l3_host_shadowed(ctrl, r)) {
 		dev_dbg(ctrl->dev, "%pI4 is an address of the switch, its entry stays\n",
 			&r->dst_ip);
@@ -1681,7 +1812,14 @@ static int otto_l3_route_install(struct otto_l3_ctrl *ctrl, struct otto_l3_route
 		if (slot < 0)
 			slot = ctrl->cfg->find_slot(ctrl, r, false);
 		if (slot < 0) {
-			dev_err(ctrl->dev, "no slot for host route %pI4\n", &r->dst_ip);
+			/* A neighbour falls back to its on-link prefix, which traps */
+			if (r->neigh)
+				dev_dbg(ctrl->dev, "no slot for neighbour %s\n",
+					otto_l3_route_dst(r, dst, sizeof(dst)));
+			else
+				dev_err(ctrl->dev, "no slot for host route %s\n",
+					otto_l3_route_dst(r, dst, sizeof(dst)));
+			r->hw_missing = true;
 			return -ENOSPC;
 		}
 
@@ -1695,6 +1833,7 @@ static int otto_l3_route_install(struct otto_l3_ctrl *ctrl, struct otto_l3_route
 	if (r->row < 0) {
 		dev_err(ctrl->dev, "no row for prefix route %s\n",
 			otto_l3_route_dst(r, dst, sizeof(dst)));
+		r->hw_missing = true;
 		return -ENOSPC;
 	}
 
@@ -1976,7 +2115,7 @@ static void otto_l3_route_update_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_ro
 	}
 
 	trap = no_port || no_l2 || otto_l3_fwd_off(ctrl, r->attr.type) ||
-	       otto_l3_local_covers(ctrl, r);
+	       otto_l3_local_covers(ctrl, r) || otto_l3_default_held(ctrl, r);
 
 	r->attr.valid = true;
 	r->attr.action = trap ? ROUTE_ACT_TRAP2CPU : ROUTE_ACT_FORWARD;
@@ -2485,14 +2624,14 @@ static void otto_l3_route_remove(struct otto_l3_ctrl *ctrl, struct otto_l3_route
 	if (otto_l3_host_shadowed(ctrl, r)) {
 		/* The entry for the address is the local route's */
 	} else if (r->is_host_route) {
-		id = ctrl->cfg->find_slot(ctrl, r, true);
+		id = r->hw_missing ? -1 : ctrl->cfg->find_slot(ctrl, r, true);
 		if (id >= 0) {
 			dev_dbg(ctrl->dev, "Got id for host route: %d\n", id);
 			r->attr.valid = false;
 			ctrl->cfg->host_route_write(ctrl, id, r);
-		} else {
-			dev_err(ctrl->dev, "Host route %pI4 was not in hardware\n",
-				&r->dst_ip);
+		} else if (!r->hw_missing) {
+			dev_err(ctrl->dev, "Host route %s was not in hardware\n",
+				otto_l3_route_dst(r, dst, sizeof(dst)));
 		}
 
 		if (r->tb_id == RT_TABLE_LOCAL && !r->replaced)
@@ -2619,6 +2758,22 @@ static struct otto_l3_route *otto_l3_route_alloc(struct otto_l3_ctrl *ctrl,
 	return r;
 }
 
+/* A route of a family that got no entry and is not on the list either: the
+ * default route of the family traps until a FIB replay, see
+ * otto_l3_default_held() and otto_l3_fib_flush_work_do()
+ */
+static void otto_l3_lose(struct otto_l3_ctrl *ctrl, u8 type, int prefix_len)
+{
+	bool v6 = type == ROUTE_TYPE_IP6UC;
+
+	if (!prefix_len || ctrl->lost[v6])
+		return;
+
+	ctrl->lost[v6] = true;
+	dev_warn(ctrl->dev, "an %s route got no entry, the default route traps until a FIB replay\n",
+		 v6 ? "IPv6" : "IPv4");
+}
+
 static int otto_l3_fib_check_v4(struct otto_l3_ctrl *ctrl,
 				struct fib_entry_notifier_info *info,
 				enum fib_event_type event)
@@ -2635,8 +2790,16 @@ static int otto_l3_fib_check_v4(struct otto_l3_ctrl *ctrl,
 		 event == FIB_EVENT_ENTRY_ADD ? "add" : "delete",
 		 &info->dst, info->dst_len, gw_message, vlan, ndev->dev_addr);
 
-	if ((info->type == RTN_BROADCAST) || ipv4_is_loopback(info->dst) || !info->dst) {
-		dev_warn(ctrl->dev, "skip loopback/broadcast addresses and default routes\n");
+	if (info->type == RTN_BROADCAST || ipv4_is_loopback(info->dst)) {
+		dev_warn(ctrl->dev, "skip loopback/broadcast addresses\n");
+		return -EINVAL;
+	}
+
+	/* Only the L3 tables hold a default row, above the catch-all. Any
+	 * other route to 0.0.0.0 (0.0.0.0/1 among them) is an ordinary prefix.
+	 */
+	if (!info->dst && !ctrl->cfg->use_l3_tables) {
+		dev_warn(ctrl->dev, "skip default routes\n");
 		return -EINVAL;
 	}
 
@@ -2651,8 +2814,10 @@ static void otto_l3_host_route_trap(struct otto_l3_ctrl *ctrl,
 
 	ipv6_addr_set_v4mapped(0, &gw);
 	route = otto_l3_route_alloc(ctrl, &gw, ROUTE_HOST);
-	if (!route)
+	if (!route) {
+		otto_l3_lose(ctrl, ROUTE_TYPE_IP4UC, info->dst_len);
 		return;
+	}
 
 	route->dst_ip = info->dst;
 	route->prefix_len = info->dst_len;
@@ -2661,8 +2826,10 @@ static void otto_l3_host_route_trap(struct otto_l3_ctrl *ctrl,
 	route->attr.action = ROUTE_ACT_TRAP2CPU;
 	route->attr.type = ROUTE_TYPE_IP4UC;
 
-	if (otto_l3_route_install(ctrl, route))
+	if (otto_l3_route_install(ctrl, route)) {
 		otto_l3_route_free(ctrl, route);
+		otto_l3_lose(ctrl, ROUTE_TYPE_IP4UC, info->dst_len);
+	}
 }
 
 /* A route this driver leaves out still has to keep a shorter prefix in
@@ -2689,6 +2856,7 @@ static void otto_l3_fib_trap_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_noti
 	route = otto_l3_route_alloc(ctrl, &gw, ROUTE_PREFIX);
 	if (!route) {
 		dev_err(ctrl->dev, "no row to trap %pI4/%d\n", &info->dst, info->dst_len);
+		otto_l3_lose(ctrl, ROUTE_TYPE_IP4UC, info->dst_len);
 		return;
 	}
 
@@ -2703,6 +2871,7 @@ static void otto_l3_fib_trap_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_noti
 	if (route->row < FIRST_PREFIX_ROW) {
 		dev_err(ctrl->dev, "no row to trap %pI4/%d\n", &info->dst, info->dst_len);
 		otto_l3_route_teardown(ctrl, route);
+		otto_l3_lose(ctrl, ROUTE_TYPE_IP4UC, info->dst_len);
 		return;
 	}
 
@@ -2795,6 +2964,7 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	else {
 		dev_err(ctrl->dev, "could not allocate a route for gw %pI4\n",
 			&nh->fib_nh_gw4);
+		otto_l3_lose(ctrl, ROUTE_TYPE_IP4UC, info->dst_len);
 		return -ENOSPC;
 	}
 
@@ -2859,6 +3029,7 @@ out_free_rt:
 	otto_l3_route_put_intf(ctrl, route);
 	otto_l3_switch_mac_put(ctrl, route->switch_mac_id);
 	otto_l3_route_free(ctrl, route);
+	otto_l3_lose(ctrl, ROUTE_TYPE_IP4UC, info->dst_len);
 	return 0;
 }
 
@@ -2949,14 +3120,11 @@ static int otto_l3_fib_check_v6(struct otto_l3_ctrl *ctrl, struct fib6_info *rt,
 	if (rt->fib6_flags & RTF_ADDRCONF)
 		return -EOPNOTSUPP;
 
-	/* A row for the default route matches every destination no more
-	 * specific row holds, and the destinations this driver leaves out are
-	 * exactly the ones it does not know what to do with - a prefix that is
-	 * on-link somewhere else among them. Sending those to the gateway is
-	 * worse than trapping them, which is what the catch-all row does with
-	 * them.
+	/* The default route takes a row above the catch-all, and forwards only
+	 * while no route of the family is left without an entry, see
+	 * otto_l3_default_held()
 	 */
-	if (ipv6_addr_any(&rt->fib6_dst.addr) || ipv6_addr_loopback(&rt->fib6_dst.addr))
+	if (ipv6_addr_loopback(&rt->fib6_dst.addr))
 		return -EOPNOTSUPP;
 
 	if (rt->fib6_nh->fib_nh_gw_family != AF_INET6)
@@ -3009,6 +3177,7 @@ static int otto_l3_fib_trap_v6(struct otto_l3_ctrl *ctrl, struct fib6_info *rt,
 	if (!route) {
 		dev_err(ctrl->dev, "no row to trap %pI6c/%d\n",
 			&rt->fib6_dst.addr, rt->fib6_dst.plen);
+		otto_l3_lose(ctrl, ROUTE_TYPE_IP6UC, rt->fib6_dst.plen);
 		return -ENOSPC;
 	}
 
@@ -3038,6 +3207,7 @@ static int otto_l3_fib_trap_v6(struct otto_l3_ctrl *ctrl, struct fib6_info *rt,
 	route->row = otto_l3_route_place(ctrl, route);
 	if (route->row < FIRST_PREFIX_ROW) {
 		otto_l3_route_teardown(ctrl, route);
+		otto_l3_lose(ctrl, ROUTE_TYPE_IP6UC, rt->fib6_dst.plen);
 		return -ENOSPC;
 	}
 
@@ -3107,7 +3277,10 @@ static int otto_l3_fib_add_v6_src(struct otto_l3_ctrl *ctrl, struct fib6_info *r
 	unsigned int plain = 0;
 	int err;
 
-	if (!rt->fib6_dst.plen || rt->fib6_type == RTN_MULTICAST)
+	/* A default route with a source traps the default row too: it sits
+	 * above the catch-all like any other default row
+	 */
+	if (rt->fib6_type == RTN_MULTICAST)
 		return 0;
 
 	/* A row that forwards here is the route without a source, which the
@@ -3322,6 +3495,7 @@ static int otto_l3_fib_add_v6(struct otto_l3_ctrl *ctrl, struct fib6_entry_notif
 	route->attr.valid = true;
 	route->row = otto_l3_route_place(ctrl, route);
 	if (route->row < 0) {
+		route->hw_missing = true;
 		fib6_info_hw_flags_set(&init_net, rt, false, false, true);
 	} else {
 		ctrl->cfg->route_write(ctrl, route->row, route);
@@ -3355,6 +3529,7 @@ out_failed:
 	if (route)
 		otto_l3_route_teardown(ctrl, route);
 	fib6_info_hw_flags_set(&init_net, rt, false, false, true);
+	otto_l3_lose(ctrl, ROUTE_TYPE_IP6UC, rt->fib6_dst.plen);
 
 	return -ENOSPC;
 }
@@ -3601,12 +3776,301 @@ static void otto_l3_local_prefix_check(struct otto_l3_ctrl *ctrl, struct fib_not
 	}
 }
 
+/* The kernel's own neighbour for a route's gateway (or neighbour), with a
+ * reference, or NULL. Called under RTNL.
+ */
+static struct neighbour *otto_l3_route_neigh(struct otto_l3_route *r)
+{
+	struct net_device *dev = __dev_get_by_index(&init_net, r->gw_ifindex);
+
+	if (!dev)
+		return NULL;
+
+	if (r->attr.type == ROUTE_TYPE_IP4UC)
+		return neigh_lookup(arp_table(&init_net), &r->gw_ip.s6_addr32[3], dev);
+
+	if (IS_REACHABLE(CONFIG_IPV6))
+		return neigh_lookup(&nd_tbl, &r->gw_ip, dev);
+
+	return NULL;
+}
+
+/* otto_l3_port_gw_resolve() without starting a resolution or logging: only
+ * a neighbour the kernel holds valid updates the routes through it
+ */
+static void otto_l3_gw_refresh(struct otto_l3_ctrl *ctrl, struct otto_l3_route *r)
+{
+	struct neighbour *n = otto_l3_route_neigh(r);
+	bool valid;
+	u64 mac;
+
+	if (!n)
+		return;
+
+	read_lock_bh(&n->lock);
+	valid = (n->nud_state & NUD_VALID) && !n->dead;
+	mac = ether_addr_to_u64(n->ha);
+	read_unlock_bh(&n->lock);
+	neigh_release(n);
+
+	if (valid)
+		otto_l3_nexthop_update(ctrl, r->attr.type, r->gw_ifindex, &r->gw_ip, mac, true);
+}
+
+/* A default row forwards or traps as otto_l3_default_held() says now: the
+ * module parameter or the routes left without an entry may have changed
+ * since it was written. Called under RTNL.
+ */
+static void otto_l3_default_check(struct otto_l3_ctrl *ctrl)
+{
+	char dst[INET6_ADDRSTRLEN + sizeof("/128")];
+	struct otto_l3_route *r;
+	bool held;
+
+	list_for_each_entry(r, &ctrl->routes_list, list) {
+		if (!otto_l3_is_default(r) || !otto_l3_route_has_gw(r) || !r->attr.valid ||
+		    otto_l3_row_frozen(ctrl, r))
+			continue;
+
+		held = otto_l3_default_held(ctrl, r);
+		if (held && r->attr.action == ROUTE_ACT_FORWARD) {
+			r->attr.action = ROUTE_ACT_TRAP2CPU;
+			r->attr.ttl_dec = false;
+			r->attr.ttl_check = false;
+			otto_l3_route_rewrite(ctrl, r);
+			if (IS_REACHABLE(CONFIG_IPV6) && r->f6i && r->row >= FIRST_PREFIX_ROW)
+				fib6_info_hw_flags_set(&init_net, r->f6i, false, true, false);
+			dev_info(ctrl->dev, "default route %s traps to the CPU\n",
+				 otto_l3_route_dst(r, dst, sizeof(dst)));
+		} else if (!held && r->attr.action == ROUTE_ACT_TRAP2CPU &&
+			   !otto_l3_fwd_off(ctrl, r->attr.type)) {
+			/* Forwards again through the gateway, if it still answers */
+			otto_l3_gw_refresh(ctrl, r);
+		}
+	}
+}
+
+/* Whether the kernel sends packets for @addr straight to the neighbour on
+ * @dev: its route is a unicast main route without a gateway out of @dev,
+ * shorter than a host route, which keeps an entry of its own.
+ */
+static bool otto_l3_neigh_onlink(struct net_device *dev, u8 type, const struct in6_addr *addr)
+{
+	bool ok = false;
+
+	if (type == ROUTE_TYPE_IP4UC) {
+		struct flowi4 fl4 = { .daddr = addr->s6_addr32[3] };
+		struct fib_result res;
+
+		rcu_read_lock();
+		if (!fib_lookup(dev_net(dev), &fl4, &res, 0) && res.type == RTN_UNICAST &&
+		    res.prefixlen < 32 && !res.fi->nh && fib_info_num_path(res.fi) == 1)
+			ok = !res.nhc->nhc_gw_family && res.nhc->nhc_dev == dev &&
+			     !res.nhc->nhc_lwtstate;
+		rcu_read_unlock();
+
+		return ok;
+	}
+
+#if IS_REACHABLE(CONFIG_IPV6)
+	{
+		int scope = ipv6_addr_type(addr);
+		struct fib6_info *from;
+		struct rt6_info *rt;
+
+		/* A link-local address is never routed, and the host table has
+		 * no notion of the link it is on
+		 */
+		if (scope == IPV6_ADDR_ANY ||
+		    scope & (IPV6_ADDR_LINKLOCAL | IPV6_ADDR_MULTICAST | IPV6_ADDR_LOOPBACK))
+			return false;
+
+		rt = rt6_lookup(dev_net(dev), addr, NULL, 0, NULL, 0);
+		if (!rt)
+			return false;
+
+		rcu_read_lock();
+		from = rcu_dereference(rt->from);
+		ok = from && rt->dst.dev == dev &&
+		     !(rt->rt6i_flags & (RTF_GATEWAY | RTF_REJECT | RTF_LOCAL | RTF_ANYCAST)) &&
+		     from->fib6_type == RTN_UNICAST && from->fib6_table->tb6_id == RT_TABLE_MAIN &&
+		     from->fib6_dst.plen < 128 && !from->fib6_src.plen && !from->nh &&
+		     !READ_ONCE(from->fib6_nsiblings) && !from->fib6_nh->fib_nh_lws;
+		rcu_read_unlock();
+		ip6_rt_put(rt);
+	}
+#endif
+
+	return ok;
+}
+
+static struct otto_l3_route *otto_l3_neigh_route_find(struct otto_l3_ctrl *ctrl, u8 type,
+						      const struct in6_addr *addr)
+{
+	struct otto_l3_route *r;
+
+	list_for_each_entry(r, &ctrl->routes_list, list)
+		if (r->neigh && r->attr.type == type && ipv6_addr_equal(&r->gw_ip, addr))
+			return r;
+
+	return NULL;
+}
+
+/* A host entry for a neighbour: the neighbour is its own gateway, so the
+ * neighbour events that move a gateway's routes move this one too, and the
+ * replace of a FIB route to the same address takes it out. Called under RTNL.
+ */
+static void otto_l3_neigh_route_add(struct otto_l3_ctrl *ctrl, u8 type, struct net_device *dev,
+				    const struct in6_addr *addr, u64 mac)
+{
+	int vlan = is_vlan_dev(dev) ? vlan_dev_vlan_id(dev) : 0;
+	char dst[INET6_ADDRSTRLEN + sizeof("/128")];
+	struct otto_l3_route *r;
+
+	/* A full table leaves the neighbour to its on-link prefix, which traps */
+	if (find_first_zero_bit(ctrl->host_route_use_bm, MAX_HOST_ROUTES) >= MAX_HOST_ROUTES)
+		return;
+
+	r = otto_l3_route_alloc(ctrl, addr, ROUTE_HOST);
+	if (!r)
+		return;
+
+	r->neigh = true;
+	r->hw_missing = true;	/* until otto_l3_route_install() takes a slot */
+	r->tb_id = RT_TABLE_MAIN;
+	r->attr.type = type;
+	if (type == ROUTE_TYPE_IP4UC) {
+		r->dst_ip = addr->s6_addr32[3];
+		r->prefix_len = 32;
+	} else {
+		r->dst_ip6 = *addr;
+		r->prefix_len = 128;
+	}
+	r->nh.rvid = vlan;
+	r->gw_ifindex = dev->ifindex;
+
+	if (otto_l3_router_mac_get(ctrl, dev))
+		goto out;
+
+	r->nh.if_id = otto_l3_alloc_egress_intf(ctrl, ether_addr_to_u64(dev->dev_addr), vlan);
+	if (r->nh.if_id < 0)
+		goto out;
+
+	otto_l3_route_update_hw(ctrl, r, mac);
+	if (!r->hw_missing) {
+		dev_dbg(ctrl->dev, "neighbour %s on %s offloaded\n",
+			otto_l3_route_dst(r, dst, sizeof(dst)), dev->name);
+		return;
+	}
+
+out:
+	otto_l3_route_teardown(ctrl, r);
+}
+
+/* A neighbour event, after the routes through it were updated */
+static void otto_l3_neigh_update(struct otto_l3_ctrl *ctrl, u8 type, int ifindex,
+				 const struct in6_addr *addr, u64 mac, bool valid)
+{
+	bool onlink = READ_ONCE(l3_onlink);
+	struct otto_l3_route *r;
+	struct net_device *dev;
+
+	if (!ctrl->cfg->host_route_write)
+		return;
+
+	/* The list only changes on this queue, so it is read before RTNL */
+	r = otto_l3_neigh_route_find(ctrl, type, addr);
+	if (!r && (!valid || !onlink))
+		return;
+
+	/* The address went from another link, ours stays */
+	if (r && r->gw_ifindex != ifindex && !valid)
+		return;
+
+	rtnl_lock();
+
+	/* Gone, moved to another link, or no longer wanted */
+	if (r && (!valid || r->gw_ifindex != ifindex || !onlink)) {
+		otto_l3_route_teardown(ctrl, r);
+		r = NULL;
+	}
+
+	if (!r && valid && onlink) {
+		dev = __dev_get_by_index(&init_net, ifindex);
+		if (dev && otto_l3_port_dev_lower_find(dev, ctrl) >= 0 &&
+		    otto_l3_neigh_onlink(dev, type, addr))
+			otto_l3_neigh_route_add(ctrl, type, dev, addr, mac);
+	}
+
+	rtnl_unlock();
+}
+
+/* A route came or went over @info's prefix: a neighbour entry inside it stays
+ * only while the kernel still reaches the address on-link. Called under RTNL.
+ */
+static void otto_l3_neigh_recheck(struct otto_l3_ctrl *ctrl, struct fib_notifier_info *info)
+{
+	struct fib_entry_notifier_info *fen;
+	struct otto_l3_route *r, *tmp;
+	struct net_device *dev;
+	struct fib6_info *rt;
+
+	list_for_each_entry_safe(r, tmp, &ctrl->routes_list, list) {
+		if (!r->neigh)
+			continue;
+
+		if (info->family == AF_INET) {
+			fen = container_of(info, struct fib_entry_notifier_info, info);
+			if (r->attr.type != ROUTE_TYPE_IP4UC ||
+			    ((r->dst_ip ^ fen->dst) & inet_make_mask(fen->dst_len)))
+				continue;
+		} else {
+			rt = container_of(info, struct fib6_entry_notifier_info, info)->rt;
+			if (r->attr.type != ROUTE_TYPE_IP6UC ||
+			    !ipv6_prefix_equal(&r->dst_ip6, &rt->fib6_dst.addr, rt->fib6_dst.plen))
+				continue;
+		}
+
+		dev = __dev_get_by_index(&init_net, r->gw_ifindex);
+		if (!dev || !otto_l3_neigh_onlink(dev, r->attr.type, &r->gw_ip))
+			otto_l3_route_teardown(ctrl, r);
+	}
+}
+
+static void otto_l3_neigh_replay(struct otto_l3_ctrl *ctrl);
+
+/* A FIB event is through: neighbours inside it are looked at again, a delete
+ * may free what a lost route held, and the default rows follow. Under RTNL.
+ */
+static void otto_l3_fib_event_after(struct otto_l3_ctrl *ctrl, struct fib_notifier_info *info,
+				    bool del, bool onlink)
+{
+	bool v6 = info->family == AF_INET6;
+
+	if (!ctrl->cfg->use_l3_tables)
+		return;
+
+	otto_l3_neigh_recheck(ctrl, info);
+
+	/* Only the default row needs what was lost back: a replay starts from
+	 * empty tables, and a delete may have made room
+	 */
+	if (del && ctrl->lost[v6] && otto_l3_default_on(v6))
+		otto_l3_resync_request(ctrl);
+
+	if (del || onlink)
+		otto_l3_neigh_replay(ctrl);
+
+	otto_l3_default_check(ctrl);
+}
+
 static void otto_l3_fib_event_work_do(struct work_struct *work)
 {
 	struct otto_l3_fib_event_work *fib_work =
 		container_of(work, struct otto_l3_fib_event_work, work);
 	struct otto_l3_ctrl *ctrl = fib_work->ctrl;
 	struct fib_rule *rule;
+	struct fib_info *fi;
 	int err;
 
 	/* Protect internal structures from changes */
@@ -3621,7 +4085,14 @@ static void otto_l3_fib_event_work_do(struct work_struct *work)
 			dev_err(ctrl->dev, "fib_add() failed\n");
 
 		otto_l3_local_prefix_check(ctrl, &fib_work->fen_info.info);
-		fib_info_put(fib_work->fen_info.fi);
+		/* A new on-link main route may make resolved neighbours eligible */
+		fi = fib_work->fen_info.fi;
+		otto_l3_fib_event_after(ctrl, &fib_work->fen_info.info, false,
+					fib_work->fen_info.tb_id == RT_TABLE_MAIN &&
+					fib_work->fen_info.type == RTN_UNICAST && !fi->nh &&
+					fib_info_nh(fi, 0)->fib_nh_dev &&
+					!fib_info_nh(fi, 0)->fib_nh_gw4);
+		fib_info_put(fi);
 		break;
 	case FIB_EVENT_ENTRY_DEL:
 		err = otto_l3_fib_del_v4(ctrl, &fib_work->fen_info);
@@ -3629,6 +4100,7 @@ static void otto_l3_fib_event_work_do(struct work_struct *work)
 			dev_err(ctrl->dev, "fib_del() failed\n");
 
 		otto_l3_local_prefix_check(ctrl, &fib_work->fen_info.info);
+		otto_l3_fib_event_after(ctrl, &fib_work->fen_info.info, true, false);
 		fib_info_put(fib_work->fen_info.fi);
 		break;
 	case FIB_EVENT_RULE_ADD:
@@ -3647,6 +4119,7 @@ static void otto_l3_fib6_event_work_do(struct work_struct *work)
 	struct otto_l3_fib_event_work *fib_work =
 		container_of(work, struct otto_l3_fib_event_work, work);
 	struct otto_l3_ctrl *ctrl = fib_work->ctrl;
+	struct fib6_info *rt;
 	int err = 0;
 
 	/* Protect internal structures from changes */
@@ -3656,10 +4129,16 @@ static void otto_l3_fib6_event_work_do(struct work_struct *work)
 	case FIB_EVENT_ENTRY_APPEND:
 		err = otto_l3_fib_add_v6(ctrl, &fib_work->fen6_info, fib_work->members);
 		otto_l3_local_prefix_check(ctrl, &fib_work->fen6_info.info);
+		rt = fib_work->fen6_info.rt;
+		otto_l3_fib_event_after(ctrl, &fib_work->fen6_info.info, false,
+					rt->fib6_table->tb6_id == RT_TABLE_MAIN && !rt->nh &&
+					rt->fib6_type == RTN_UNICAST &&
+					!rt->fib6_nh->fib_nh_gw_family);
 		break;
 	case FIB_EVENT_ENTRY_DEL:
 		err = otto_l3_fib_del_v6(ctrl, &fib_work->fen6_info, fib_work->members);
 		otto_l3_local_prefix_check(ctrl, &fib_work->fen6_info.info);
+		otto_l3_fib_event_after(ctrl, &fib_work->fen6_info.info, true, false);
 		break;
 	}
 	if (err)
@@ -3798,6 +4277,8 @@ static void otto_l3_net_event_work_do(struct work_struct *work)
 
 	otto_l3_nexthop_update(net_work->ctrl, net_work->type, net_work->ifindex,
 			       &net_work->gw_addr, net_work->mac, net_work->valid);
+	otto_l3_neigh_update(net_work->ctrl, net_work->type, net_work->ifindex,
+			     &net_work->gw_addr, net_work->mac, net_work->valid);
 
 	kfree(net_work);
 }
@@ -3875,6 +4356,108 @@ static int otto_l3_netevent_notifier(struct notifier_block *this, unsigned long 
 	}
 
 	return NOTIFY_DONE;
+}
+
+static void otto_l3_neigh_replay_one(struct neighbour *n, void *data)
+{
+	struct otto_l3_ctrl *ctrl = data;
+
+	otto_l3_netevent_notifier(&ctrl->ne_nb, NETEVENT_NEIGH_UPDATE, n);
+}
+
+/* Neighbours resolved before their entry could be taken - before l3_onlink
+ * was set, a replay, or the route that makes them on-link - get it now, as if
+ * each had just been updated
+ */
+static void otto_l3_neigh_replay(struct otto_l3_ctrl *ctrl)
+{
+	if (!READ_ONCE(l3_onlink) || !ctrl->cfg->host_route_write)
+		return;
+
+	neigh_for_each(arp_table(&init_net), otto_l3_neigh_replay_one, ctrl);
+	if (IS_REACHABLE(CONFIG_IPV6))
+		neigh_for_each(&nd_tbl, otto_l3_neigh_replay_one, ctrl);
+}
+
+/* The switch forwards to a neighbour without the kernel seeing the traffic,
+ * so the kernel lets it go stale and never checks it again. A route whose
+ * entry was hit since the last poll has its stale neighbour confirmed, the
+ * way traffic through the CPU would. The hit bit is cleared only then, so the
+ * route dump keeps showing it otherwise. Called under RTNL.
+ */
+static void otto_l3_route_refresh(struct otto_l3_ctrl *ctrl, struct otto_l3_route *r)
+{
+	struct otto_l3_route e = {};
+	struct neighbour *n;
+	int slot;
+
+	if (!otto_l3_route_has_gw(r) || !r->attr.valid || otto_l3_row_frozen(ctrl, r))
+		return;
+
+	/* A next hop that found no L2 entry for its MAC tries again */
+	if (r->attr.action != ROUTE_ACT_FORWARD) {
+		if (r->nh.mac && !r->nh.l2_installed && !otto_l3_fwd_off(ctrl, r->attr.type))
+			otto_l3_gw_refresh(ctrl, r);
+		return;
+	}
+
+	if (r->is_host_route) {
+		slot = ctrl->cfg->find_slot(ctrl, r, true);
+		if (slot < 0)
+			return;
+		ctrl->cfg->host_route_read(ctrl, slot, &e);
+	} else {
+		if (r->row < FIRST_PREFIX_ROW)
+			return;
+		ctrl->cfg->route_read(ctrl, r->row, &e);
+	}
+
+	if (!e.attr.valid || !e.attr.hit)
+		return;
+
+	n = otto_l3_route_neigh(r);
+	if (!n)
+		return;
+
+	if (READ_ONCE(n->nud_state) & NUD_STALE) {
+		neigh_event_send(n, NULL);
+		r->attr.hit = false;
+		otto_l3_route_rewrite(ctrl, r);
+	}
+	neigh_release(n);
+}
+
+/* DELAY_PROBE_TIME, as mlxsw polls: a stale neighbour that is used is probed
+ * after that long, so a hit is acted on within one kernel probe cycle
+ */
+static unsigned long otto_l3_poll_delay(void)
+{
+	return max_t(unsigned long, NEIGH_VAR(&arp_table(&init_net)->parms, DELAY_PROBE_TIME), HZ);
+}
+
+/* Runs on the driver's queue, so nothing else walks the routes meanwhile */
+static void otto_l3_poll(struct work_struct *work)
+{
+	struct otto_l3_ctrl *ctrl = container_of(to_delayed_work(work), struct otto_l3_ctrl,
+						 poll_work);
+	bool onlink = READ_ONCE(l3_onlink);
+	struct otto_l3_route *r, *tmp;
+
+	rtnl_lock();
+	list_for_each_entry_safe(r, tmp, &ctrl->routes_list, list) {
+		if (r->neigh && !onlink)
+			otto_l3_route_teardown(ctrl, r);
+		else
+			otto_l3_route_refresh(ctrl, r);
+	}
+	otto_l3_default_check(ctrl);
+	rtnl_unlock();
+
+	if (onlink && !ctrl->onlink_on)
+		otto_l3_neigh_replay(ctrl);
+	ctrl->onlink_on = onlink;
+
+	queue_delayed_work(ctrl->priv->wq, &ctrl->poll_work, otto_l3_poll_delay());
 }
 
 /* debugfs dump of the RTL930x L3 route tables (realtek_otto_l3/routes,
@@ -4483,6 +5066,7 @@ const struct otto_l3_config otto_l3_930x_cfg = {
 	.set_egress_mac = otto_l3_930x_set_egress_mac,
 	.set_dmac = otto_l3_930x_set_dmac,
 	.set_egress_intf = otto_l3_930x_set_egress_intf,
+	.host_route_read = otto_l3_930x_host_route_read,
 	.host_route_write = otto_l3_930x_host_route_write,
 	.get_router_mac = otto_l3_930x_get_router_mac,
 	.set_router_mac = otto_l3_930x_set_router_mac,
@@ -4515,6 +5099,7 @@ void otto_l3_remove(struct rtl838x_switch_priv *priv)
 
 	/* A replay would register the FIB notifier again */
 	disable_delayed_work_sync(&ctrl->resync_work);
+	disable_delayed_work_sync(&ctrl->poll_work);
 
 	if (ctrl->nd_nb.notifier_call) {
 		unregister_netdevice_notifier(&ctrl->nd_nb);
@@ -4563,7 +5148,13 @@ static void otto_l3_fib_flush_work_do(struct work_struct *work)
 	list_for_each_entry_safe(r, tmp, &fw->ctrl->routes_list, list)
 		if (r->tb_id)
 			otto_l3_route_teardown(fw->ctrl, r);
+	/* What could not be placed is gone with the rest */
+	fw->ctrl->lost[0] = false;
+	fw->ctrl->lost[1] = false;
 	rtnl_unlock();
+
+	/* Neighbour entries have no FIB entry to come back with */
+	otto_l3_neigh_replay(fw->ctrl);
 }
 
 /* A dump that raced a change to the FIB leaves programmed what it saw, and the
@@ -4638,6 +5229,7 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 	/* Until the FIB notifier is in place there is nothing to replay */
 	INIT_DELAYED_WORK(&ctrl->resync_work, otto_l3_resync_work_do);
 	disable_delayed_work(&ctrl->resync_work);
+	INIT_DELAYED_WORK(&ctrl->poll_work, otto_l3_poll);
 
 	match = of_match_node(otto_l3_of_ids, dev->of_node);
 	if (!match)
@@ -4709,6 +5301,7 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 		smp_mb(); /* pairs with the one in otto_l3_resync_request() */
 		if (READ_ONCE(ctrl->resync_wanted))
 			queue_delayed_work(system_long_wq, &ctrl->resync_work, 0);
+		queue_delayed_work(priv->wq, &ctrl->poll_work, otto_l3_poll_delay());
 	}
 
 	if (ctrl->cfg->dbgfs_init)
