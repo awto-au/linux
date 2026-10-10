@@ -48,10 +48,31 @@ struct realtek_soc_data {
 
 struct rtl83xx_soc_info soc_info;
 
+#define RTL930X_PLL_CPU_CTRL0		0xe208	/* CPU_CMU_NCODE_IN 11:4, CPU_CMU_SEL_DIV4 2, CPU_CMU_SEL_PREDIV 1:0 */
+#define RTL930X_PLL_CPU_MISC_CTRL	0xe210	/* REG_CMU_DIVN2_CPU 6:4 */
+
+/* CPU clock from the CPU PLL: 25 MHz x (4 if SEL_DIV4) x (NCODE + 2) x 2 / 2^PREDIV / (DIVN2 + 2) */
+static u32 __init rtl930x_cpu_freq(void)
+{
+	u32 ctrl0 = sw_r32(RTL930X_PLL_CPU_CTRL0), ctrl2 = sw_r32(RTL930X_PLL_CPU_MISC_CTRL);
+	u32 khz = 25000 * ((ctrl0 & BIT(2)) ? 4 : 1) * (((ctrl0 >> 4) & 0xff) + 2) * 2;
+
+	khz >>= ctrl0 & 3;
+	khz /= ((ctrl2 >> 4) & 7) + 2;
+	return khz * 1000;
+}
+
 static unsigned int __init realtek_measure_hpt_freq(void)
 {
 	struct device_node *np;
 	u32 freq = 500000000;
+
+	/* the bootloader may have changed the PLL: the DT value would be stale */
+	if (soc_info.family == RTL9300_FAMILY_ID) {
+		freq = rtl930x_cpu_freq();
+		pr_info("CPU frequency from PLL: %uMHz", freq / 1000000);
+		return freq / 2;
+	}
 
 	np = of_find_node_by_name(NULL, "cpus");
 	if (!np) {
