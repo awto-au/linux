@@ -191,7 +191,10 @@
 
 #define RTETH_RX_RING_SIZE			128
 #define RTETH_RX_RINGS				2
-#define RTETH_TX_RING_SIZE			16
+/* SDK value (#16); was 16 */
+#define RTETH_TX_RING_SIZE			32
+/* free slots before a stopped TX queue is woken */
+#define RTETH_TX_WAKE_THRESH			4
 #define RTETH_TX_RINGS				2
 #define RTETH_TX_TRIGGER(ctrl, ring)		((0x16 >> ring) & ctrl->cfg->tx_trigger_mask)
 
