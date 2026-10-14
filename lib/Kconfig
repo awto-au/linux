@@ -594,6 +594,18 @@ config LWQ_TEST
 	help
 	  Run boot-time test of light-weight queuing.
 
+config RUST_C2RUST_BOOT_TEST
+	bool "Boot-screen a batch of rule-conformant c2rust translations"
+	depends on RUST
+	default n
+	help
+	  Combined-image boot-screening mechanism (issue #28): swaps in a
+	  small batch of already-individually-verified c2rust-transpiled
+	  files (lib/klist.c, lib/sys_info.c, lib/rcuref.c) in place of
+	  their C originals, all behind this one switch, to test whether
+	  multiple rule-conformant files can be screened together in one
+	  boot-test cycle instead of one dedicated boot pair per file.
+
 endmenu
 
 config GENERIC_IOREMAP

@@ -37,10 +37,49 @@ lib-y := string.o vsprintf.o \
 	 rbtree.o radix-tree.o timerqueue.o xarray.o \
 	 maple_tree.o idr.o extable.o irq_regs.o \
 	 flex_proportions.o ratelimit.o \
-	 is_single_threaded.o plist.o kobject_uevent.o \
- seq_buf.o siphash.o dec_and_lock.o \
+	 kobject_uevent.o \
+ siphash.o \
 	 nmi_backtrace.o \
-	 buildid.o objpool.o sys_info.o
+	 buildid.o objpool.o
+
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+lib-y += plist_rs.o
+else
+lib-y += plist.o
+endif
+
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+lib-y += dec_and_lock_rs.o
+else
+lib-y += dec_and_lock.o
+endif
+
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+lib-y += is_single_threaded_rs.o
+else
+lib-y += is_single_threaded.o
+endif
+
+# linux-rs: seq_buf.c's seq_buf_printf() is a real C-variadic function
+# definition, needing the unstable c_variadic rustc feature — a
+# deliberate, reviewed divergence from upstream Rust-for-Linux's own
+# feature list (they have no precedent for defining a variadic-ABI
+# function in Rust; see rulesdb/rules/0032-c-variadic-feature-gate.toml
+# and awto-au/linux-rs#37/#28 for the decision trail). c_variadic is
+# added to rust_allowed_features (scripts/Makefile.build) for this.
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+lib-y += seq_buf_rs.o
+else
+lib-y += seq_buf.o
+endif
+
+# linux-rs: issue #28 combined-image boot screening — Rust when the
+# screening switch is on.
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+lib-y += sys_info_rs.o
+else
+lib-y += sys_info.o
+endif
 
 # linux-rs: translated TU — Rust when Rust is available.
 ifdef CONFIG_RUST
@@ -54,7 +93,14 @@ lib-$(CONFIG_PRINTK) += dump_stack.o
 lib-$(CONFIG_SMP) += cpumask.o
 lib-$(CONFIG_MIN_HEAP) += min_heap.o
 
-lib-y	+= kobject.o klist.o
+lib-y	+= kobject.o
+# linux-rs: issue #28 combined-image boot screening — Rust when the
+# screening switch is on.
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+lib-y += klist_rs.o
+else
+lib-y += klist.o
+endif
 obj-y	+= lockref.o
 
 CONTEXT_ANALYSIS_rhashtable.o := y
@@ -65,13 +111,69 @@ obj-y += sort_rs.o bcd_rs.o list_sort_rs.o
 else
 obj-y += sort.o bcd.o list_sort.o
 endif
-obj-y += debug_locks.o random32.o \
-	 bust_spinlocks.o scatterlist.o \
-	 uuid.o iov_iter.o clz_ctz.o \
-	 bsearch.o lwq.o kfifo.o \
+obj-y += random32.o \
+	 scatterlist.o \
+	 iov_iter.o clz_ctz.o \
+	 bsearch.o \
 	 percpu-refcount.o rhashtable.o \
-	 once.o refcount.o rcuref.o errseq.o bucket_locks.o \
+	 refcount.o \
 	 generic-radix-tree.o kasprintf.o
+
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+obj-y += once_rs.o
+else
+obj-y += once.o
+endif
+
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+obj-y += debug_locks_rs.o
+else
+obj-y += debug_locks.o
+endif
+
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+obj-y += bust_spinlocks_rs.o
+else
+obj-y += bust_spinlocks.o
+endif
+
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+obj-y += lwq_rs.o
+else
+obj-y += lwq.o
+endif
+
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+obj-y += kfifo_rs.o
+else
+obj-y += kfifo.o
+endif
+
+# linux-rs: issue #28 combined-image boot screening — Rust when the
+# screening switch is on.
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+obj-y += rcuref_rs.o
+else
+obj-y += rcuref.o
+endif
+
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+obj-y += uuid_rs.o
+else
+obj-y += uuid.o
+endif
+
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+obj-y += errseq_rs.o
+else
+obj-y += errseq.o
+endif
+
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+obj-y += bucket_locks_rs.o
+else
+obj-y += bucket_locks.o
+endif
 
 # linux-rs: translated TU — Rust when Rust is available.
 ifdef CONFIG_RUST
@@ -204,7 +306,11 @@ obj-$(CONFIG_ZSTD_DECOMPRESS) += zstd/
 obj-$(CONFIG_XZ_DEC) += xz/
 
 lib-$(CONFIG_DECOMPRESS_GZIP) += decompress_inflate.o
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+lib-$(CONFIG_DECOMPRESS_BZIP2) += decompress_bunzip2_rs.o
+else
 lib-$(CONFIG_DECOMPRESS_BZIP2) += decompress_bunzip2.o
+endif
 lib-$(CONFIG_DECOMPRESS_LZMA) += decompress_unlzma.o
 lib-$(CONFIG_DECOMPRESS_XZ) += decompress_unxz.o
 lib-$(CONFIG_DECOMPRESS_LZO) += decompress_unlzo.o
@@ -260,7 +366,11 @@ obj-$(CONFIG_CLOSURES) += closure.o
 
 obj-$(CONFIG_DQL) += dynamic_queue_limits.o
 
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+obj-$(CONFIG_GLOB) += glob_rs.o
+else
 obj-$(CONFIG_GLOB) += glob.o
+endif
 
 obj-$(CONFIG_DIMLIB) += dim/
 obj-$(CONFIG_SIGNATURE) += digsig.o
@@ -273,7 +383,11 @@ obj-$(CONFIG_GENERIC_STRNLEN_USER) +=
 obj-$(CONFIG_GENERIC_NET_UTILS) += net_utils.o
 
 obj-$(CONFIG_SG_SPLIT) += sg_split.o
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+obj-$(CONFIG_SG_POOL) += sg_pool_rs.o
+else
 obj-$(CONFIG_SG_POOL) += sg_pool.o
+endif
 obj-$(CONFIG_MEMREGION) += memregion.o
 obj-$(CONFIG_STMP_DEVICE) += stmp_device.o
 obj-$(CONFIG_IRQ_POLL) += irq_poll.o
@@ -347,7 +461,11 @@ obj-$(CONFIG_SBITMAP) += sbitmap.o
 
 obj-$(CONFIG_PARMAN) += parman.o
 
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+obj-y += group_cpus_rs.o
+else
 obj-y += group_cpus.o
+endif
 
 # GCC library routines
 obj-$(CONFIG_GENERIC_LIB_ASHLDI3) += ashldi3.o
@@ -361,7 +479,11 @@ obj-$(CONFIG_OBJAGG) += objagg.o
 # pldmfw library
 obj-$(CONFIG_PLDMFW) += pldmfw/
 
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+obj-$(CONFIG_GENERIC_LIB_DEVMEM_IS_ALLOWED) += devmem_is_allowed_rs.o
+else
 obj-$(CONFIG_GENERIC_LIB_DEVMEM_IS_ALLOWED) += devmem_is_allowed.o
+endif
 
 obj-$(CONFIG_FIRMWARE_TABLE) += fw_table.o
 
