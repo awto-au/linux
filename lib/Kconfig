@@ -594,6 +594,11 @@ config LWQ_TEST
 	help
 	  Run boot-time test of light-weight queuing.
 
+config RUST_C2RUST_BOOT_TEST
+	bool "Boot-test c2rust-translated lib/lwq.c in place of the C version"
+	depends on RUST
+	default n
+
 endmenu
 
 config GENERIC_IOREMAP
