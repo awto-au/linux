@@ -594,6 +594,13 @@ config LWQ_TEST
 	help
 	  Run boot-time test of light-weight queuing.
 
+config RUST_C2RUST_BOOT_TEST
+	bool "Boot debug_locks.c's c2rust translation instead of the C original"
+	depends on RUST
+	default n
+	help
+	  Combined-image boot-screening proof-of-mechanism (linux-rs#28).
+
 endmenu
 
 config GENERIC_IOREMAP
