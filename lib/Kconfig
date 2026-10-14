@@ -391,6 +391,18 @@ config SGL_ALLOC
 	bool
 	default n
 
+config RUST_C2RUST_BOOT_TEST
+	bool "Rust (c2rust-generated) translation of lib/rcuref.c"
+	depends on RUST
+	default n
+	help
+	  Build the c2rust-generated Rust translation of
+	  rcuref_get_slowpath()/rcuref_put_slowpath() in place of
+	  lib/rcuref.c, as a combined boot test for mechanically-passing
+	  (c2rust-clean + rule-conformant) translations, wired into a real
+	  kernel image alongside the existing CONFIG_RUST hand-translated
+	  TUs and a pure-C image, for a real three-way boot comparison.
+
 config IOMMU_HELPER
 	bool
 
