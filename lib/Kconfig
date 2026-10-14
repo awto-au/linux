@@ -391,6 +391,20 @@ config SGL_ALLOC
 	bool
 	default n
 
+config RUST_C2RUST_BOOT_TEST
+	bool "Rust (c2rust-generated) translation of lib/is_single_threaded.c"
+	depends on RUST
+	default n
+	help
+	  Build the c2rust-generated Rust translation of
+	  current_is_single_threaded() in place of lib/is_single_threaded.c,
+	  as a combined boot test for mechanically-passing (c2rust-clean +
+	  rule-conformant) translations, wired into a real kernel image
+	  alongside the existing CONFIG_RUST hand-translated TUs and a
+	  pure-C image, for a real three-way boot comparison.
+
+	  If unsure, say N: lib/is_single_threaded.c remains the default.
+
 config IOMMU_HELPER
 	bool
 

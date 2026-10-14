@@ -37,10 +37,17 @@ lib-y := ctype.o string.o vsprintf.o \
 	 rbtree.o radix-tree.o timerqueue.o xarray.o \
 	 maple_tree.o idr.o extable.o irq_regs.o \
 	 flex_proportions.o ratelimit.o \
-	 is_single_threaded.o plist.o kobject_uevent.o \
+	 plist.o kobject_uevent.o \
  seq_buf.o siphash.o dec_and_lock.o \
 	 nmi_backtrace.o \
 	 buildid.o objpool.o sys_info.o
+
+# linux-rs: translated TU — Rust when Rust is available.
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+lib-y += is_single_threaded_rs.o
+else
+lib-y += is_single_threaded.o
+endif
 
 lib-$(CONFIG_UNION_FIND) += union_find.o
 lib-$(CONFIG_PRINTK) += dump_stack.o
