@@ -59,12 +59,19 @@ else
 obj-y += sort.o bcd.o list_sort.o
 endif
 obj-y += debug_locks.o random32.o \
-	 bust_spinlocks.o scatterlist.o \
+	 scatterlist.o \
 	 uuid.o iov_iter.o clz_ctz.o \
 	 bsearch.o lwq.o kfifo.o \
 	 percpu-refcount.o rhashtable.o \
 	 once.o refcount.o rcuref.o errseq.o bucket_locks.o \
 	 generic-radix-tree.o kasprintf.o
+
+# linux-rs: translated TU — Rust when boot-screening this file (issue #28).
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+obj-y += bust_spinlocks_rs.o
+else
+obj-y += bust_spinlocks.o
+endif
 
 # linux-rs: translated TU — Rust when Rust is available.
 ifdef CONFIG_RUST
