@@ -130,32 +130,6 @@ pub unsafe extern "C" fn strcpy(dest: *mut c_char, src: *const c_char) -> *mut c
     tmp
 }
 
-/// Copy at most `count` bytes from `src` to `dest`, NUL-padding if
-/// `src` is shorter (does NOT guarantee NUL-termination if `src` is
-/// `count` bytes or longer — same as libc `strncpy`).
-///
-/// # Safety
-/// `dest` has room for `count` bytes; `src` is a valid NUL-terminated
-/// C string with at least as many readable bytes as get copied.
-#[export]
-pub unsafe extern "C" fn strncpy(dest: *mut c_char, src: *const c_char, mut count: usize) -> *mut c_char {
-    let mut tmp = dest;
-    let mut src = src;
-    // SAFETY: per function contract.
-    unsafe {
-        while count != 0 {
-            let c = *src;
-            *tmp = c;
-            if c != 0 {
-                src = src.add(1);
-            }
-            tmp = tmp.add(1);
-            count -= 1;
-        }
-    }
-    dest
-}
-
 const ALLBUTLAST_BYTE_MASK: usize = !0usize >> 8;
 
 /// `has_zero`/`prep_zero_mask`/`create_zero_mask`/`find_zero`/
