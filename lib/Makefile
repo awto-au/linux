@@ -47,7 +47,14 @@ lib-$(CONFIG_PRINTK) += dump_stack.o
 lib-$(CONFIG_SMP) += cpumask.o
 lib-$(CONFIG_MIN_HEAP) += min_heap.o
 
-lib-y	+= kobject.o klist.o
+lib-y	+= kobject.o
+
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+lib-y += klist_rs.o
+else
+lib-y += klist.o
+endif
+
 obj-y	+= lockref.o
 
 CONTEXT_ANALYSIS_rhashtable.o := y
