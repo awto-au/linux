@@ -3,7 +3,7 @@
 //!
 //! Scope: `bitmap_parselist`, `bitmap_parse`, and their pure-string
 //! static helpers. Deferred to a follow-up pass: `bitmap_parse_user`,
-//! `bitmap_print_to_pagebuf`, `bitmap_print_to_buf`,
+//! `bitmap_print_to_buf`,
 //! `bitmap_print_bitmask_to_buf`, `bitmap_print_list_to_buf`,
 //! `bitmap_parselist_user` — these need `memdup_user_nul`/`kasprintf`/
 //! `scnprintf`/`memory_read_from_buffer`, none yet available in this
