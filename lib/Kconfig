@@ -8,6 +8,17 @@ config BINARY_PRINTF
 
 menu "Library routines"
 
+config RUST_C2RUST_BOOT_TEST
+	bool "Build c2rust-translated boot-screening candidate instead of the C original"
+	depends on RUST
+	default n
+	help
+	  Combined-image boot-screening gate (issue linux-rs#28): selects the
+	  c2rust-translated Rust object in place of the plain-C original for
+	  whichever single TU this worktree is wiring in. Independent of
+	  every other CONFIG_RUST* gate so it can be A/B toggled without
+	  disturbing already-landed translations.
+
 config LINEAR_RANGES
 	tristate
 
