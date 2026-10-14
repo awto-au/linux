@@ -594,6 +594,16 @@ config LWQ_TEST
 	help
 	  Run boot-time test of light-weight queuing.
 
+config RUST_C2RUST_BOOT_TEST
+	bool "Boot-screen a raw c2rust translation in place of lib/vdso/datastore.c"
+	depends on RUST
+	default n
+	help
+	  Combined-image boot-screening proof-of-mechanism (issue #28):
+	  swaps lib/vdso/datastore.o for a c2rust-translated
+	  lib/vdso/datastore_rs.o. Independent of every other CONFIG_RUST*
+	  gate so it can be A/B toggled without disturbing landed TUs.
+
 endmenu
 
 config GENERIC_IOREMAP
