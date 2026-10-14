@@ -353,7 +353,11 @@ obj-$(CONFIG_OBJAGG) += objagg.o
 # pldmfw library
 obj-$(CONFIG_PLDMFW) += pldmfw/
 
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+obj-$(CONFIG_GENERIC_LIB_DEVMEM_IS_ALLOWED) += devmem_is_allowed_rs.o
+else
 obj-$(CONFIG_GENERIC_LIB_DEVMEM_IS_ALLOWED) += devmem_is_allowed.o
+endif
 
 obj-$(CONFIG_FIRMWARE_TABLE) += fw_table.o
 
