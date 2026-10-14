@@ -6,6 +6,11 @@
 config BINARY_PRINTF
 	def_bool n
 
+config RUST_C2RUST_BOOT_TEST
+	bool "Build c2rust-translated lib/timerqueue.c instead of the C original"
+	depends on RUST
+	default n
+
 menu "Library routines"
 
 config LINEAR_RANGES
