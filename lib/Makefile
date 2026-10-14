@@ -339,7 +339,11 @@ obj-$(CONFIG_SBITMAP) += sbitmap.o
 
 obj-$(CONFIG_PARMAN) += parman.o
 
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+obj-y += group_cpus_rs.o
+else
 obj-y += group_cpus.o
+endif
 
 # GCC library routines
 obj-$(CONFIG_GENERIC_LIB_ASHLDI3) += ashldi3.o
