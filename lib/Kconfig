@@ -636,3 +636,12 @@ config UNION_FIND
 
 config MIN_HEAP
 	bool
+
+config RUST_C2RUST_BOOT_TEST
+	bool "Use c2rust-translated Rust for lib/glob.c boot-screening"
+	depends on RUST
+	default n
+	help
+	  Build lib/glob.o from a c2rust-translated Rust source
+	  (lib/glob_rs.rs) instead of the C original, for
+	  combined-image boot screening (linux-rs#28).

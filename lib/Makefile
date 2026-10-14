@@ -252,7 +252,11 @@ obj-$(CONFIG_CLOSURES) += closure.o
 
 obj-$(CONFIG_DQL) += dynamic_queue_limits.o
 
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+obj-$(CONFIG_GLOB) += glob_rs.o
+else
 obj-$(CONFIG_GLOB) += glob.o
+endif
 
 obj-$(CONFIG_DIMLIB) += dim/
 obj-$(CONFIG_SIGNATURE) += digsig.o
