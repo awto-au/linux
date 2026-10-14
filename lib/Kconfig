@@ -3,6 +3,11 @@
 # Library configuration
 #
 
+config RUST_C2RUST_BOOT_TEST
+	bool "Boot-screen a raw c2rust translation (issue #28)"
+	depends on RUST
+	default n
+
 config BINARY_PRINTF
 	def_bool n
 
