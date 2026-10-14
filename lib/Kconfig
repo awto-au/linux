@@ -594,6 +594,15 @@ config LWQ_TEST
 	help
 	  Run boot-time test of light-weight queuing.
 
+config RUST_C2RUST_BOOT_TEST
+	bool "Build c2rust-translated lib/ files instead of the C originals"
+	depends on RUST
+	default n
+	help
+	  Combined-image boot screening (issue linux-rs#28): swaps in a
+	  raw c2rust transpile of a chosen lib/ source file in place of
+	  its C original, for a single agent worktree at a time.
+
 endmenu
 
 config GENERIC_IOREMAP
