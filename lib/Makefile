@@ -40,7 +40,13 @@ lib-y := ctype.o string.o vsprintf.o \
 	 is_single_threaded.o plist.o kobject_uevent.o \
  seq_buf.o siphash.o dec_and_lock.o \
 	 nmi_backtrace.o \
-	 buildid.o objpool.o sys_info.o
+	 buildid.o sys_info.o
+
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+lib-y += objpool_rs.o
+else
+lib-y += objpool.o
+endif
 
 lib-$(CONFIG_UNION_FIND) += union_find.o
 lib-$(CONFIG_PRINTK) += dump_stack.o
