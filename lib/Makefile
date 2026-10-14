@@ -63,8 +63,14 @@ obj-y += debug_locks.o random32.o \
 	 uuid.o iov_iter.o clz_ctz.o \
 	 bsearch.o lwq.o kfifo.o \
 	 percpu-refcount.o rhashtable.o \
-	 once.o refcount.o rcuref.o errseq.o bucket_locks.o \
+	 once.o refcount.o rcuref.o errseq.o \
 	 generic-radix-tree.o kasprintf.o
+
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+obj-y += bucket_locks_rs.o
+else
+obj-y += bucket_locks.o
+endif
 
 # linux-rs: translated TU — Rust when Rust is available.
 ifdef CONFIG_RUST
