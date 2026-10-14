@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: GPL-2.0
 # Font handling
 
+ifdef CONFIG_RUST_C2RUST_BOOT_TEST
+font-y := fonts_rs.o
+else
 font-y := fonts.o
+endif
 font-$(CONFIG_FRAMEBUFFER_CONSOLE_ROTATION) += font_rotate.o
 
 # Built-in fonts; sorted by Family-Size in ascending order
