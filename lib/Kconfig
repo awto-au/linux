@@ -636,3 +636,8 @@ config UNION_FIND
 
 config MIN_HEAP
 	bool
+
+config RUST_C2RUST_BOOT_TEST
+	bool "Boot-screen a raw c2rust translation in place of a C lib file"
+	depends on RUST
+	default n
