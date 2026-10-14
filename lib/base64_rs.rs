@@ -158,19 +158,21 @@ pub unsafe extern "C" fn base64_decode(
 
         let mut val: i32 =
             ((rev[*s as usize] as i32) << 12) | ((rev[*s.add(1) as usize] as i32) << 6);
-        *dst.add(j) = (val >> 10) as u8;
-        j += 1;
 
         if srclen == 2 {
             // C compares against unsigned 0x800003ff: val converts to u32.
             if val as u32 & 0x800003ff != 0 {
                 return -1;
             }
+            *dst.add(j) = (val >> 10) as u8;
+            j += 1;
         } else {
             val |= rev[*s.add(2) as usize] as i32;
             if val as u32 & 0x80000003 != 0 {
                 return -1;
             }
+            *dst.add(j) = (val >> 10) as u8;
+            j += 1;
             *dst.add(j) = (val >> 2) as u8;
             j += 1;
         }
