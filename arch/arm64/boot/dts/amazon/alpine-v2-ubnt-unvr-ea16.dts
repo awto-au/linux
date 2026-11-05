@@ -40,6 +40,14 @@
 	compatible = "ubnt,unvr", "al,alpine-v2";
 
 	aliases {
+		/* U-Boot's fdt_fixup_ethernet() (boot/image-fdt.c, every bootm)
+		 * walks these and writes local-mac-address from ethaddr /
+		 * eth<N>addr, which it reads from the NOR identity blob via
+		 * alu_eth_core_read_rom_hwaddr(). Without the aliases the fixup
+		 * silently does nothing and al_eth invents a random MAC (#340).
+		 * The per-unit address stays in flash - never in this DT. */
+		ethernet0 = &eth1;
+		ethernet1 = &eth2;
 		serial0 = &uart0;
 		serial1 = &uart1;
 		serial2 = &uart2;
@@ -53,8 +61,12 @@
 		 * later NAND/rootfs boot appends root= via the U-Boot bootargs.
 		 * iommu.passthrough=1 MUST live here AND in the U-Boot bootargs
 		 * (U-Boot's `setenv bootargs` overrides the DTB value at boot).
+		 *
+		 * panic=15 + reboot=cold match awto-uboot's CONFIG_BOOTARGS. This
+		 * line is only used when nothing overrides it - netboot, recovery -
+		 * which is exactly when nobody is watching to power-cycle it (#259).
 		 */
-		bootargs = "pci=pcie_bus_perf console=ttyS0,115200 sysid=ea16 ubnthal.sysid=ea16 reboot=warm rw iommu.passthrough=1";
+		bootargs = "pci=pcie_bus_perf console=ttyS0,115200 sysid=ea16 ubnthal.sysid=ea16 reboot=cold panic=15 rw iommu.passthrough=1";
 		stdout-path = "serial0:115200n8";
 		linux,pci-probe-only = <1>;
 	};
@@ -103,10 +115,10 @@
 			 * we had none at all, worse than upstream. al_eth/al_dma/
 			 * al_ssm still have no entry here (upstream doesn't either)
 			 * and still log "of_irq_parse_pci failed rc=-22" at probe -
-			 * benign, MSI-X only (msi-parent = &msix); silenced properly
-			 * via a PCI_FIXUP_HEADER quirk in pcie-al-internal.c instead,
-			 * since a DT interrupt-map can't express "this pin is wired
-			 * to nothing" for devices that never use INTx at all.
+			 * benign, MSI-X only (msi-parent = &msix). NOT silenced: the
+			 * PCI_FIXUP_HEADER quirk that used to claim this was retired
+			 * to debris/patches/ (#206 - dev->pin = 0 is a no-op, since
+			 * pci_assign_irq() re-reads the pin from hardware). #55.
 			 *
 			 * Re-applied (#131) after #130's UBSAN crash was proven
 			 * unrelated: reverting both this and the PCI quirk did NOT
@@ -189,9 +201,11 @@
 			reg = <0x00 0xfd8c0000 0x00 0x2400>;
 		};
 
-		/* Memory controller */
+		/* Memory controller. Both compatibles: the vendor DTS string plus
+		 * the one drivers/edac/al_mc_edac.c actually matches - with only the
+		 * vendor string, EDAC_AL_MC builds but never binds (#208). */
 		mc: memory-controller@f0080000 {
-			compatible = "annapurna-labs,alpine-mc";
+			compatible = "annapurna-labs,alpine-mc", "amazon,al-mc-edac";
 			reg = <0x00 0xf0080000 0x00 0x10000>;
 		};
 
@@ -316,15 +330,12 @@
 			reg = <0x00 0xfd880000 0x00 0x1000>;
 			interrupts = <GIC_SPI 21 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&sbclk>;
-			/* 100 kHz (Standard-mode) = stock's speed. NOT max-by-default:
-			 * the s35390a RTC on mux ch0 is timing-fussy and at 400 kHz mis-reads
-			 * a phantom START/STOP and holds SDA -> whole-bus wedge, unrecoverable
-			 * in SW on this bus (pld-i2c SCL/SDA have no GPIO alt for a bit-bang
-			 * deblock, and the DW v1.20 core has no HW SDA-stuck recovery - see
-			 * docs/rtc-s35390a-fault.md). Stock ran 100 kHz and talked to the RTC
-			 * fine; slower SCL = more setup/hold margin = no latch. The tolerant
-			 * devices (PCA9575/EEPROM/mux/adt7475) don't care about the speed. */
-			clock-frequency = <100000>;
+			/* 400 kHz (Fast-mode) = every part's rated max: 24C64, PCA9575 x2,
+			 * PCA9546, adt7475, s35390a. The SFP EEPROM's SFF-8472 100 kHz is
+			 * the standard being conservative, not its silicon. 100 kHz was a
+			 * workaround for the ch0 wedge; that turned out to be mainline's
+			 * IC_ENABLE.ABORT, not timing (#86), so the reason is gone. */
+			clock-frequency = <400000>;
 			/* SDA hold = 300 ns, from the stock working DTB (live.dts:255,
 			 * i2c-sda-hold-time-ns=0x12c). Without it the DW driver reuses the
 			 * leftover DW_IC_SDA_HOLD register value (U-Boot/reset), which is
@@ -332,6 +343,13 @@
 			 * / hold SDA -> whole-bus wedge + `controller timed out` flood.
 			 * The tolerant devices (adt7475/EEPROM/PCA9575) never noticed. */
 			i2c-sda-hold-time-ns = <300>;
+			/* Mainline's __i2c_dw_disable() issues a hardware IC_ENABLE.ABORT
+			 * (2023, commit 2409205acd3c), terminating the transfer mid-byte.
+			 * The s35390a answers that by holding SDA low until clocked
+			 * through - the unrecoverable wedge. The vendor 4.19 kernel that
+			 * drives this board has no abort at all and never wedged. Our
+			 * U-Boot has none either, and its RTC access works (#86). */
+			snps,no-enable-abort;
 			/* Stock's proven raw SCL counts (live.dts:249-254) so the
 			 * s35390a doesn't wedge. At clock-frequency=100000 the SS
 			 * pair is used; fs/hs carried for completeness. Honored by
@@ -359,7 +377,11 @@
 			i2c_mux: i2c-mux@71 {
 				compatible = "nxp,pca9546";
 				reg = <0x71>;
-				i2c-mux-idle-disconnect;
+				/* i2c-mux-idle-disconnect REMOVED for #86 testing: stock's
+				 * mux node has compatible+reg only (live.dts:257-259), and
+				 * i2c-mux.c:49-53 runs deselect unconditionally - including
+				 * after a FAILED transfer - so we write to the mux while ch0
+				 * may be mid-recovery. A delta we introduced. */
 				#address-cells = <1>;
 				#size-cells = <0>;
 
@@ -371,14 +393,14 @@
 
 					/* OFFLINE for now (status="disabled"): U-Boot does the RTC
 					 * reset-at-probe (clears POC/BLD before Linux, alpine.c), and
-					 * keeping Linux off ch0's RTC avoids re-triggering the SDA-hold
-					 * wedge (docs/rtc-s35390a-fault.md, #86) so the ch0/SFP-EEPROM
-					 * segment stays scannable + no al_eth poll flood. Fedora keeps
-					 * time via NTP. Re-enable once a Linux-side ch0 recovery exists. */
+					 * Enabled since #86: the ch0 wedge was mainline's IC_ENABLE.ABORT,
+					 * suppressed by snps,no-enable-abort on the parent. A full ch0
+					 * scan and repeated RTC reads now leave the bus clean. The cell
+					 * has no battery, so this only holds time across a WARM reboot;
+					 * NTP remains the real clock source. */
 					rtc@30 {
 						compatible = "sii,s35390a";
 						reg = <0x30>;
-						status = "disabled";
 					};
 				};
 
@@ -503,6 +525,10 @@
 			mdio-freq-khz = <1000>;
 			auto-neg-mode = "out-of-band";
 			status = "okay";
+			/* NOR "EEPROM" base MAC - the authority al_eth checks the
+			 * bootloader-programmed EC value against. */
+			nvmem-cells = <&mac_base>;
+			nvmem-cell-names = "mac-address";
 		};
 
 		eth2: ethernet@fc200000 {
@@ -524,6 +550,9 @@
 			 * (al_eth_phylink.c), not by compatible/reg. */
 			managed = "in-band-status";
 			sfp = <&sfp0>;
+			/* No MAC cell: the 10G MAC is base+1 in al_eth
+			 * (AL_ETH_10G_MAC_OFFSET). Stock's "mac: [base] + [2]" is a
+			 * COUNT of two allocated addresses, not an offset (#222, #223). */
 		};
 
 		eth3: ethernet@fc300000 {
@@ -661,83 +690,102 @@
 				#address-cells = <1>;
 				#size-cells = <1>;
 
-				/*
-				 * Preboot + stock U-Boot, laid out by the Annapurna TOC @0x80000
-				 * (magic 0x070c070c). Exact offsets within this partition:
-				 *   0x00000  preboot obj  = S2 + al_boot + stage3 (payload @0x21000)
-				 *   0x80000  the TOC itself
-				 *   0xA1000  uboot obj    = stock U-Boot 2015.07 (hdr @0xA1048,
-				 *            AArch64, loads/runs at RAM 0x1100000), fills to 0x1c0000
-				 * "al_boot" the CODE lives here (in preboot), NOT the empty NAND
-				 * al_boot partition. docs/bootloader.md, nor-boot-chain.md.
-				 */
-				partition@0 {
-					reg = <0x000000 0x1c0000>;
-					label = "u-boot";
-				};
+				/* ofpart skips a partition subnode carrying a `compatible`
+				 * unless the parent is a dedicated "fixed-partitions" node, so
+				 * the EEPROM nvmem partition was silently dropped. */
+				partitions {
+					compatible = "fixed-partitions";
+					#address-cells = <1>;
+					#size-cells = <1>;
 
-				/* Stock U-Boot env (holds eth1addr). OUR U-Boot uses mtd3
-				 * (Factory) instead, so this stays stock's — left intact for a
-				 * clean fallback to stock. */
-				partition@1c0000 {
-					reg = <0x1c0000 0x10000>;
-					label = "u-boot env";
-				};
+					/*
+					 * Preboot + stock U-Boot, laid out by the Annapurna TOC @0x80000
+					 * (magic 0x070c070c). Exact offsets within this partition:
+					 *   0x00000  preboot obj  = S2 + al_boot + stage3 (payload @0x21000)
+					 *   0x80000  the TOC itself
+					 *   0xA1000  uboot obj    = stock U-Boot 2015.07 (hdr @0xA1048,
+					 *            AArch64, loads/runs at RAM 0x1100000), fills to 0x1c0000
+					 * "al_boot" the CODE lives here (in preboot), NOT the empty NAND
+					 * al_boot partition. docs/bootloader.md, nor-boot-chain.md.
+					 */
+					partition@0 {
+						reg = <0x000000 0x1c0000>;
+						label = "u-boot";
+					};
 
-				/* Redundant copy of the stock env. */
-				partition@1d0000 {
-					reg = <0x1d0000 0x10000>;
-					label = "u-boot env redundant";
-				};
+					/* Stock U-Boot env (holds eth1addr). OUR U-Boot uses mtd3
+					 * (Factory) instead, so this stays stock's — left intact for a
+					 * clean fallback to stock. */
+					partition@1c0000 {
+						reg = <0x1c0000 0x10000>;
+						label = "u-boot env";
+					};
 
-				/*
-				 * Stock: blank 0xFF, unused. REPURPOSED: our U-Boot stores its
-				 * OWN env here (CONFIG_ENV_OFFSET=0x1e0000) - #81, docs/mtd.md.
-				 * read-only in Linux so Fedora never clobbers our U-Boot env.
-				 * (Label kept "Factory" for stock traceability; content is ours.)
-				 */
-				partition@1e0000 {
-					reg = <0x1e0000 0x10000>;
-					label = "Factory";
-					read-only;
-				};
+					/* Redundant copy of the stock env. */
+					partition@1d0000 {
+						reg = <0x1d0000 0x10000>;
+						label = "u-boot env redundant";
+					};
 
-				/*
-				 * Board identity blob (NOT a chip - a NOR region Ubiquiti named
-				 * "EEPROM"). base MAC @0x0, boardid @0xC, ONIE TLV @0xd000, RSA
-				 * key @0xe004. ubnthal reads it; our U-Boot reads the MAC (#89).
-				 * The real EEPROM chip is the 24C64 @ i2c 0x57 (DDR blob).
-				 */
-				partition@1f0000 {
-					reg = <0x1f0000 0x10000>;
-					label = "EEPROM";
-					read-only;
-				};
+					/*
+					 * Stock: blank 0xFF, unused. REPURPOSED: our U-Boot stores its
+					 * OWN env here (CONFIG_ENV_OFFSET=0x1e0000) - #81, docs/mtd.md.
+					 * read-only in Linux so Fedora never clobbers our U-Boot env.
+					 * (Label kept "Factory" for stock traceability; content is ours.)
+					 */
+					partition@1e0000 {
+						reg = <0x1e0000 0x10000>;
+						label = "Factory";
+						read-only;
+					};
 
-				/* STOCK U-Boot loads this on a recovery boot (recovery_mem_read
-				 * + AL_RECOVERY_OFFSET, board.c). Fallback kernel, 16 MiB. */
-				partition@200000 {
-					reg = <0x200000 0x1000000>;
-					label = "recovery kernel";
-				};
+					/*
+					 * Board identity blob (NOT a chip - a NOR region Ubiquiti named
+					 * "EEPROM"). base MAC @0x0, boardid @0xC, ONIE TLV @0xd000, RSA
+					 * key @0xe004. ubnthal reads it; our U-Boot reads the MAC (#89).
+					 * The real EEPROM chip is the 24C64 @ i2c 0x57 (DDR blob).
+					 */
+					/* compatible "nvmem-cells" makes this partition an nvmem
+					 * provider, so al_eth can compare the stored base MAC
+					 * against what the bootloader programmed into the EC (#89). */
+					eeprom: partition@1f0000 {
+						compatible = "nvmem-cells";
+						reg = <0x1f0000 0x10000>;
+						label = "EEPROM";
+						read-only;
+						#address-cells = <1>;
+						#size-cells = <1>;
 
-				/* ext4: persistent device settings (mounted /tmp/.config).
-				 * Linux/userspace only — STOCK U-Boot never touches it. Wiped by
-				 * a factory reset. Stock-usage summary: docs/mtd.md. */
-				partition@1200000 {
-					reg = <0x1200000 0xdff000>;
-					label = "config";
-				};
+						mac_base: mac-base@0 {
+							reg = <0x0 0x6>;
+						};
+					};
 
-				/*
-				 * DEAD: named "cksum" but it is 100% 0x00 and never a live
-				 * checksum (nothing reads it). 5.1.25 dropped this partition
-				 * (absorbed into config). Kept here only to map the real flash;
-				 * safe to remove. docs/mtd.md.
-				 */
-				partition@1fff000 {
-					reg = <0x1fff000 0x1000>;
-					label = "cksum";
+					/* STOCK U-Boot loads this on a recovery boot (recovery_mem_read
+					 * + AL_RECOVERY_OFFSET, board.c). Fallback kernel, 16 MiB. */
+					partition@200000 {
+						reg = <0x200000 0x1000000>;
+						label = "recovery kernel";
+					};
+
+					/* ext4: persistent device settings (mounted /tmp/.config).
+					 * Linux/userspace only — STOCK U-Boot never touches it. Wiped by
+					 * a factory reset. Stock-usage summary: docs/mtd.md. */
+					partition@1200000 {
+						reg = <0x1200000 0xdff000>;
+						label = "config";
+					};
+
+					/*
+					 * DEAD: named "cksum" but it is 100% 0x00 and never a live
+					 * checksum (nothing reads it). 5.1.25 dropped this partition
+					 * (absorbed into config). Kept here only to map the real flash;
+					 * safe to remove. docs/mtd.md.
+					 */
+					partition@1fff000 {
+						reg = <0x1fff000 0x1000>;
+						label = "cksum";
+					};
 				};
 			};
 		};
@@ -784,10 +832,21 @@
 				label = "linux_kernel";
 			};
 
-			/* Root filesystem (~1004 MiB; squashfs on stock). bootargs root=
-			 * target only — the kernel mounts it; U-Boot never reads it. */
+			/* awto-uboot, 1 MiB, raw (#216). Stock's bootcmd does
+			 * `nand read 0x1100000 0x1300000 0x100000; go` from here.
+			 * Split out so it is not the first MiB of a ~1 GB partition
+			 * labelled "rootfs" (#208). Deliberately NOT read-only:
+			 * `mtd write` from Linux is the point of having the driver. */
 			partition@1300000 {
-				reg = <0x01300000 0x3ec00000>;
+				reg = <0x01300000 0x00100000>;
+				label = "awto-uboot";
+			};
+
+			/* Stock's squashfs root, less the awto-uboot MiB above. Unused:
+			 * we boot ext4 from the SSD. bootargs root= target on stock only;
+			 * U-Boot never reads it. */
+			partition@1400000 {
+				reg = <0x01400000 0x3eb00000>;
 				label = "rootfs";
 			};
 
@@ -827,10 +886,28 @@
 	sfp0: sfp {
 		compatible = "sff,sfp";
 		i2c-bus = <&sfp_i2c>;
+		/* hwmon temp sensor -> sfp-thermal zone (#125); local extension, not in sff,sfp binding */
+		#thermal-sensor-cells = <1>;
 	};
 
 	/* Thermal zone — critical shutdown at 105 C */
 	thermal-zones {
+		/* Monitoring only (#125): no cooling-maps, no critical/passive trip.
+		 * "hot" trip is notify-only; module is rated 70 C case. */
+		sfp-thermal {
+			polling-delay-passive = <0>;
+			polling-delay = <5000>;
+			thermal-sensors = <&sfp0 0>;
+
+			trips {
+				sfp_hot: sfp-hot {
+					temperature = <70000>;
+					hysteresis = <2000>;
+					type = "hot";
+				};
+			};
+		};
+
 		cpu-thermal {
 			polling-delay-passive = <250>;
 			polling-delay = <1000>;
@@ -865,7 +942,7 @@
 		led-ulogo-blue {
 			label = "ulogo_blue";
 			gpios = <&gpio3 7 GPIO_ACTIVE_LOW>;
-			linux,default-trigger = "default-on";
+			linux,default-trigger = "disk-activity";
 		};
 
 		led-ulogo-white {
@@ -929,8 +1006,14 @@
 	 * HDD bay power control — signals via PCA9575 @0x21:
 	 *   pins 0-3 power-enable, 4-7 presence (active-low), 12-15 fault LEDs.
 	 * Force-power-on workaround: GPIO5 pin 2.
-	 * No mainline ui,hdd-pwrctl driver binds this; kept as the board wiring
-	 * record. pwren is owned by reg_hdd_bay1-4 above.
+	 * Bound by modules/ubnt_hdd_pwrctl (#208): presence + fault LEDs only.
+	 * pwren is the wiring record ONLY - reg_hdd_bay1-4 above own those
+	 * lines so AHCI has a supplier to defer on (#104). Nothing may claim it
+	 * here; two consumers of one gpio is -EBUSY.
+	 * Do NOT rename it to pwren-gpios: the "-gpios" suffix makes the OF gpio
+	 * core treat it as a real consumer of lines 0-3, reg-fixed-voltage then
+	 * fails "can't get GPIO", and both AHCI controllers defer forever -> no
+	 * rootfs. The non-standard name is deliberate and load-bearing.
 	 */
 	hdd-pwrctl {
 		compatible = "ui,hdd-pwrctl";
@@ -941,33 +1024,33 @@
 		hdd@0 {
 			reg = <0>;
 			slot-no = <1>;
-			pwren     = <&i2c_gpio1 0 GPIO_ACTIVE_HIGH>;
-			present   = <&i2c_gpio1 4 GPIO_ACTIVE_LOW>;
-			fault-led = <&i2c_gpio1 12 GPIO_ACTIVE_HIGH>;
+			pwren           = <&i2c_gpio1 0 GPIO_ACTIVE_HIGH>;
+			present-gpios   = <&i2c_gpio1 4 GPIO_ACTIVE_LOW>;
+			fault-led-gpios = <&i2c_gpio1 12 GPIO_ACTIVE_HIGH>;
 		};
 
 		hdd@1 {
 			reg = <1>;
 			slot-no = <2>;
-			pwren     = <&i2c_gpio1 1 GPIO_ACTIVE_HIGH>;
-			present   = <&i2c_gpio1 5 GPIO_ACTIVE_LOW>;
-			fault-led = <&i2c_gpio1 13 GPIO_ACTIVE_HIGH>;
+			pwren           = <&i2c_gpio1 1 GPIO_ACTIVE_HIGH>;
+			present-gpios   = <&i2c_gpio1 5 GPIO_ACTIVE_LOW>;
+			fault-led-gpios = <&i2c_gpio1 13 GPIO_ACTIVE_HIGH>;
 		};
 
 		hdd@2 {
 			reg = <2>;
 			slot-no = <3>;
-			pwren     = <&i2c_gpio1 2 GPIO_ACTIVE_HIGH>;
-			present   = <&i2c_gpio1 6 GPIO_ACTIVE_LOW>;
-			fault-led = <&i2c_gpio1 14 GPIO_ACTIVE_HIGH>;
+			pwren           = <&i2c_gpio1 2 GPIO_ACTIVE_HIGH>;
+			present-gpios   = <&i2c_gpio1 6 GPIO_ACTIVE_LOW>;
+			fault-led-gpios = <&i2c_gpio1 14 GPIO_ACTIVE_HIGH>;
 		};
 
 		hdd@3 {
 			reg = <3>;
 			slot-no = <4>;
-			pwren     = <&i2c_gpio1 3 GPIO_ACTIVE_HIGH>;
-			present   = <&i2c_gpio1 7 GPIO_ACTIVE_LOW>;
-			fault-led = <&i2c_gpio1 15 GPIO_ACTIVE_HIGH>;
+			pwren           = <&i2c_gpio1 3 GPIO_ACTIVE_HIGH>;
+			present-gpios   = <&i2c_gpio1 7 GPIO_ACTIVE_LOW>;
+			fault-led-gpios = <&i2c_gpio1 15 GPIO_ACTIVE_HIGH>;
 		};
 	};
 
@@ -1048,20 +1131,16 @@
 };
 
 /*
- * SP804 timer0: unused. Linux clocksource/clockevent is the ARMv8 arch timer
- * (armv8-timer), not SP804. The dtsi enables timer0 with clocks=<&sbclk> but no
- * clock-names="apb_pclk", so the arm,primecell/AMBA pclk lookup never resolves
- * and the device defers probe forever ("deferred probe pending: reason
- * unknown"). Disable it to match timer1/2/3 (already disabled in the dtsi).
+ * SP804 timer0. Linux's clocksource/clockevent is the ARMv8 arch timer, not
+ * SP804, but timer0 is named rather than disabled - see the node comment.
  */
 &timer0 {
 	/*
-	 * SP804 deferred forever because an arm,primecell device needs "apb_pclk"
-	 * BY NAME for the AMBA bus-clock lookup; the dtsi node has clocks=<&sbclk>
-	 * with no clock-names. Fix (not disable): name it. One clock named apb_pclk
-	 * is used for both the timer and the bus (valid per the sp804 binding).
-	 * UNVERIFIED on hardware — confirm the timer probes once the boot-source
-	 * (which kernel+DTB U-Boot actually loads) is resolved so DTB changes test.
+	 * An arm,primecell device needs "apb_pclk" BY NAME for the AMBA bus-clock
+	 * lookup; the dtsi node has clocks=<&sbclk> with no clock-names, so it
+	 * deferred forever. Name it rather than disable it - one clock named
+	 * apb_pclk serves both timer and bus (valid per the sp804 binding).
+	 * Verified on hardware (#69): boot logs "clocksource: arm,sp804".
 	 */
 	clock-names = "apb_pclk";
 };
